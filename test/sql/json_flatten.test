@@ -1,0 +1,219 @@
+# name: test/sql/json_flatten.test
+# description: json_flatten flattens nested JSON structures using dotted keys and covers edge cases
+# group: [sql]
+
+require json_tools
+
+# Ensure helper constructors from the json extension are available
+statement ok
+LOAD json;
+
+# ========================================
+# Basic Behavior Tests
+# ========================================
+
+query I
+SELECT json_flatten('{"a": 1, "b": {"c": 2}}');
+----
+{"a":1,"b.c":2}
+
+query I
+SELECT json_flatten('{"x": 1, "y": 2}');
+----
+{"x":1,"y":2}
+
+query I
+SELECT json_flatten('{"a": {"b": {"c": {"d": 4}}}}');
+----
+{"a.b.c.d":4}
+
+query I
+SELECT json_flatten('{"a": [1, {"b": 2}, [3, 4]]}');
+----
+{"a.0":1,"a.1.b":2,"a.2.0":3,"a.2.1":4}
+
+query I
+SELECT json_flatten(NULL);
+----
+NULL
+
+query I
+SELECT json_flatten('{"": 1}');
+----
+{"":1}
+
+statement error
+SELECT json_flatten('{');
+----
+Conversion Error: Malformed JSON at byte 1 of input: unexpected end of data.  Input: "{"
+
+# ========================================
+# Unicode Support Tests
+# ========================================
+
+query I
+SELECT json_flatten('{"中文": 1, "日本語": 2, "한국어": 3}');
+----
+{"中文":1,"日本語":2,"한국어":3}
+
+query I
+SELECT json_flatten('{"🔥": "fire", "🚀": "rocket"}');
+----
+{"🔥":"fire","🚀":"rocket"}
+
+query I
+SELECT json_flatten('{"Русский": "текст"}');
+----
+{"Русский":"текст"}
+
+query I
+SELECT json_flatten('{"العربية": 42}');
+----
+{"العربية":42}
+
+query I
+SELECT json_flatten('{"outer": {"日本語": {"inner": 1}}}');
+----
+{"outer.日本語.inner":1}
+
+query I
+SELECT json_flatten('{"name": "José García"}');
+----
+{"name":"José García"}
+
+query I
+SELECT json_flatten('{"user": {"bio": "Engineer 👨‍💻"}}');
+----
+{"user.bio":"Engineer 👨‍💻"}
+
+query I
+SELECT json_flatten('{"english": 1, "日本語": 2, "mixed_英語": 3}');
+----
+{"english":1,"日本語":2,"mixed_英語":3}
+
+query I
+SELECT json_flatten('{"items": [{"名前": "田中"}]}');
+----
+{"items.0.名前":"田中"}
+
+query I
+SELECT json_flatten('{"": "Unicode値"}');
+----
+{"":"Unicode値"}
+
+# ========================================
+# Empty Container Tests
+# ========================================
+
+query I
+SELECT json_flatten('{}');
+----
+{}
+
+query I
+SELECT json_flatten('[]');
+----
+{}
+
+query I
+SELECT json_flatten('{"a": {}, "b": 1}');
+----
+{"b":1}
+
+query I
+SELECT json_flatten('{"items": [], "count": 0}');
+----
+{"count":0}
+
+query I
+SELECT json_flatten('{"empty_obj": {}, "empty_arr": [], "data": {"x": 1}}');
+----
+{"data.x":1}
+
+query I
+SELECT json_flatten('{"outer": {"inner": {}}}');
+----
+{}
+
+query I
+SELECT json_flatten('{"a": {"b": [], "c": 2}}');
+----
+{"a.c":2}
+
+query I
+SELECT json_flatten('{"": {}}');
+----
+{}
+
+# ========================================
+# Large Array Index Tests
+# ========================================
+
+query I
+WITH large AS (
+    SELECT json_flatten(json_object('arr', json_group_array(i))) AS flat
+    FROM range(0, 1000) t(i)
+)
+SELECT flat::VARCHAR LIKE '%"arr.0":0%' AND flat::VARCHAR LIKE '%"arr.999":999%' AS valid
+FROM large;
+----
+true
+
+query I
+WITH large AS (
+    SELECT json_flatten(json_object('arr', json_group_array(i))) AS flat
+    FROM range(0, 10000) t(i)
+)
+SELECT flat::VARCHAR LIKE '%"arr.9999":9999%' AS valid
+FROM large;
+----
+true
+
+query I
+WITH large AS (
+    SELECT json_flatten(json_object('arr', json_group_array(i))) AS flat
+    FROM range(0, 100000) t(i)
+)
+SELECT flat::VARCHAR LIKE '%"arr.99999":99999%' AS valid
+FROM large;
+----
+true
+
+query I
+WITH sparse AS (
+    SELECT json_flatten(json_group_array(CASE WHEN i = 999 THEN 'val999' ELSE NULL END)) AS flat
+    FROM range(0, 1000) t(i)
+)
+SELECT flat::VARCHAR LIKE '%"999":"val999"%' AS valid
+FROM sparse;
+----
+true
+
+query I
+SELECT json_flatten('{"a": [0,1,2,3,4,5,6,7,8,9,10]}');
+----
+{"a.0":0,"a.1":1,"a.2":2,"a.3":3,"a.4":4,"a.5":5,"a.6":6,"a.7":7,"a.8":8,"a.9":9,"a.10":10}
+
+# ========================================
+# Deeply Nested Array Tests
+# ========================================
+
+query I
+SELECT json_flatten('[[1, 2], [3, 4]]');
+----
+{"0.0":1,"0.1":2,"1.0":3,"1.1":4}
+
+query I
+SELECT json_flatten('[[[1, 2]]]');
+----
+{"0.0.0":1,"0.0.1":2}
+
+query I
+SELECT json_flatten('[[[[[[42]]]]]]');
+----
+{"0.0.0.0.0.0":42}
+
+query I
+SELECT json_flatten('[{"a": [{"b": 1}]}]');
+----
+{"0.a.0.b":1}
