@@ -1,115 +1,167 @@
-# json-tools
+# DuckDB JSON Tools Extension
 
-This repository is based on https://github.com/duckdb/extension-template, check it out if you want to build and ship your own DuckDB extension.
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Main Extension Distribution Pipeline](https://github.com/Flamefork/duckdb-json-tools/actions/workflows/MainDistributionPipeline.yml/badge.svg)](https://github.com/Flamefork/duckdb-json-tools/actions/workflows/MainDistributionPipeline.yml)
 
----
+A DuckDB extension for high-performance JSON normalization and manipulation.
 
-This extension currently focuses on high-performance JSON normalization utilities.
+This extension provides a set of utility functions to work with JSON data, focusing on performance-critical operations that are not covered by DuckDB's core JSON functionality.
 
+**WARNING: This extension is maintained on a best-effort basis by a developer who doesn’t write C++ professionally, so expect rough edges. It hasn’t been hardened for production, and you should validate it in your own environment before relying on it. Feedback and contributions are welcome via GitHub.**  
 
-## Building
-### Managing dependencies
-DuckDB extensions uses VCPKG for dependency management. Enabling VCPKG is very simple: follow the [installation instructions](https://vcpkg.io/en/getting-started) or just run the following:
-```shell
-git clone https://github.com/Microsoft/vcpkg.git
-./vcpkg/bootstrap-vcpkg.sh
-export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
-```
-Note: VCPKG is only required for extensions that want to rely on it for dependency management. If you want to develop an extension without dependencies, or want to do your own dependency management, just skip this step. Note that the example extension uses VCPKG to build with a dependency for instructive purposes, so when skipping this step the build may not work without removing the dependency.
+## Core Features
 
-### Build steps
-Now to build the extension, run:
-```sh
-make
-```
-The main binaries that will be built are:
-```sh
-./build/release/duckdb
-./build/release/test/unittest
-./build/release/extension/json_tools/json_tools.duckdb_extension
-```
-- `duckdb` is the binary for the duckdb shell with the extension code automatically loaded.
-- `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
-- `json_tools.duckdb_extension` is the loadable binary as it would be distributed.
+- **`json_flatten(json)`**: Recursively flattens nested JSON objects and arrays into a single-level object with dot-separated keys.
+- **`json_add_prefix(json, text)`**: Adds a string prefix to every top-level key in a JSON object.
 
-## Running the extension
-To run the extension code, simply start the shell with `./build/release/duckdb`.
+## Quick Start
 
-Now we can use the features from the extension directly in DuckDB.
-
-### `json_flatten(json) -> json`
-
-Rewrites nested JSON structures into dotted-key objects:
-```
-D select json_flatten('{"outer": {"inner": [1, 2]}}') as result;
-┌───────────────────────────────────────┐
-│                 result                │
-│                  json                 │
-├───────────────────────────────────────┤
-│ {"outer.inner.0":1,"outer.inner.1":2} │
-└───────────────────────────────────────┘
-```
-
-**Unicode Support**: `json_flatten()` preserves UTF-8 characters in both keys and values:
 ```sql
-SELECT json_flatten('{"日本語": "こんにちは", "emoji": "🚀"}');
--- Result: {"日本語":"こんにちは","emoji":"🚀"}
-```
+-- Build from source first (see Installation section)
+LOAD './build/release/extension/json_tools/json_tools.duckdb_extension';
 
-**Empty Container Behavior**: Empty objects and arrays do not have leaf values, so they are omitted from the flattened output:
-```sql
-SELECT json_flatten('{"data": [], "meta": {}, "count": 5}');
--- Result: {"count":5}
-```
+-- Flatten nested JSON
+SELECT json_flatten('{"user": {"name": "Alice", "age": 30}}');
+-- Result: {"user.name":"Alice","user.age":30}
 
-### `json_add_prefix(json, prefix) -> json`
-
-Adds a prefix to all top-level keys in a JSON object:
-```sql
+-- Add prefix to keys
 SELECT json_add_prefix('{"a": 1, "b": 2}', 'prefix.');
 -- Result: {"prefix.a":1,"prefix.b":2}
-
-SELECT json_add_prefix('{"user": {"name": "Alice"}, "count": 5}', 'data_');
--- Result: {"data_user":{"name":"Alice"},"data_count":5}
 ```
 
-Note: This function requires the input to be a JSON object. It will raise an error if given a JSON array or primitive value.
+## Installation
 
-## Running the tests
-Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:
-```sh
-make test
-```
+> **Note:** This extension is not yet available in the DuckDB community repository. Once published, it will be installable via `INSTALL json_tools FROM community;`
 
-### Installing the deployed binaries
-To install your extension binaries from S3, you will need to do two things. Firstly, DuckDB should be launched with the
-`allow_unsigned_extensions` option set to true. How to set this will depend on the client you're using. Some examples:
+### Current Installation (Development)
 
-CLI:
+This extension must currently be built from source. See the [Development](#development) section below for build instructions.
+
+Once built, load it in DuckDB:
+
+**CLI:**
 ```shell
 duckdb -unsigned
 ```
 
-Python:
+```sql
+LOAD './build/release/extension/json_tools/json_tools.duckdb_extension';
+```
+
+**Python:**
 ```python
-con = duckdb.connect(':memory:', config={'allow_unsigned_extensions' : 'true'})
+import duckdb
+con = duckdb.connect(':memory:', config={'allow_unsigned_extensions': 'true'})
+con.execute("LOAD './build/release/extension/json_tools/json_tools.duckdb_extension'")
 ```
 
-NodeJS:
-```js
-db = new duckdb.Database(':memory:', {"allow_unsigned_extensions": "true"});
-```
+## Usage
 
-Secondly, you will need to set the repository endpoint in DuckDB to the HTTP url of your bucket + version of the extension
-you want to install. To do this run the following SQL query in DuckDB:
+### `json_flatten(json) -> json`
+
+Rewrites nested JSON structures into a flat, dotted-key object. This is particularly useful for unnesting complex JSON for easier analysis.
+
+**Example:**
 ```sql
-SET custom_extension_repository='bucket.s3.eu-west-1.amazonaws.com/<your_extension_name>/latest';
+SELECT json_flatten('{"outer": {"inner": [1, 2]}}');
 ```
-Note that the `/latest` path will allow you to install the latest extension version available for your current version of
-DuckDB. To specify a specific version, you can pass the version instead.
+*Result:*
+```json
+{"outer.inner.0":1,"outer.inner.1":2}
+```
 
-After running these steps, you can install and load your extension using the regular INSTALL/LOAD commands in DuckDB:
+It preserves UTF-8 characters in both keys and values:
 ```sql
-INSTALL json_tools
-LOAD json_tools
+SELECT json_flatten('{"日本語": "こんにちは", "emoji": "🚀"}');
 ```
+*Result:*
+```json
+{"日本語":"こんにちは","emoji":"🚀"}
+```
+
+Empty objects (`{}`) and arrays (`[]`) are omitted from the flattened output as they contain no leaf values:
+```sql
+SELECT json_flatten('{"data": [], "meta": {}, "count": 5}');
+```
+*Result:*
+```json
+{"count":5}
+```
+
+### `json_add_prefix(json, prefix) -> json`
+
+Adds a given prefix to all top-level keys in a JSON object. This is useful for avoiding key collisions when merging data from different sources.
+
+**Example:**
+```sql
+SELECT json_add_prefix('{"a": 1, "b": 2}', 'prefix.');
+```
+*Result:*
+```json
+{"prefix.a":1,"prefix.b":2}
+```
+
+The prefix is added even to keys whose values are nested objects:
+```sql
+SELECT json_add_prefix('{"user": {"name": "Alice"}, "count": 5}', 'data_');
+```
+*Result:*
+```json
+{"data_user":{"name":"Alice"},"data_count":5}
+```
+
+**Note:** This function requires the input to be a JSON object. It will raise an error if given a JSON array or primitive value.
+
+## Error Handling
+
+- `json_flatten()` returns an error for malformed JSON
+- `json_add_prefix()` requires a JSON object (not array or primitive value)
+- Maximum nesting depth: 1000 levels
+- Empty objects (`{}`) and arrays (`[]`) are omitted from flattened output
+
+## Development
+
+### Building from Source
+
+This project uses VCPKG for dependency management.
+
+1.  **Set up VCPKG:**
+    ```shell
+    git clone https://github.com/Microsoft/vcpkg.git
+    ./vcpkg/bootstrap-vcpkg.sh
+    export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
+    ```
+    *(You may want to add the `export` line to your shell's profile, e.g., `~/.bashrc` or `~/.zshrc`)*
+
+2.  **Build the extension:**
+    ```shell
+    make
+    ```
+
+This will create the following binaries in the `./build/release` directory:
+- `duckdb`: A shell with the extension pre-loaded.
+- `test/unittest`: The test runner.
+- `extension/json_tools/json_tools.duckdb_extension`: The distributable extension binary.
+
+### Running Tests
+
+To run the SQL tests:
+```shell
+make test
+```
+
+## Contributing
+
+Contributions are welcome! Please:
+1. Open an issue first to discuss proposed changes
+2. Add tests for new functionality in `test/sql/`
+3. Run `make test` before submitting a pull request
+
+See [GitHub Issues](https://github.com/Flamefork/duckdb-json-tools/issues) for current tasks and feature requests.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+*This extension was originally based on the [DuckDB Extension Template](https://github.com/duckdb/extension-template).*
