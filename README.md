@@ -35,7 +35,11 @@ The main binaries that will be built are:
 ## Running the extension
 To run the extension code, simply start the shell with `./build/release/duckdb`.
 
-Now we can use the features from the extension directly in DuckDB. The repository ships the `json_flatten` scalar function, which rewrites nested JSON structures into dotted-key objects:
+Now we can use the features from the extension directly in DuckDB.
+
+### `json_flatten(json) -> json`
+
+Rewrites nested JSON structures into dotted-key objects:
 ```
 D select json_flatten('{"outer": {"inner": [1, 2]}}') as result;
 ┌───────────────────────────────────────┐
@@ -46,19 +50,30 @@ D select json_flatten('{"outer": {"inner": [1, 2]}}') as result;
 └───────────────────────────────────────┘
 ```
 
-### Unicode Support
-`json_flatten()` preserves UTF-8 characters in both keys and values:
+**Unicode Support**: `json_flatten()` preserves UTF-8 characters in both keys and values:
 ```sql
 SELECT json_flatten('{"日本語": "こんにちは", "emoji": "🚀"}');
 -- Result: {"日本語":"こんにちは","emoji":"🚀"}
 ```
 
-### Empty Container Behavior
-Empty objects and arrays do not have leaf values, so they are omitted from the flattened output:
+**Empty Container Behavior**: Empty objects and arrays do not have leaf values, so they are omitted from the flattened output:
 ```sql
 SELECT json_flatten('{"data": [], "meta": {}, "count": 5}');
 -- Result: {"count":5}
 ```
+
+### `json_add_prefix(json, prefix) -> json`
+
+Adds a prefix to all top-level keys in a JSON object:
+```sql
+SELECT json_add_prefix('{"a": 1, "b": 2}', 'prefix.');
+-- Result: {"prefix.a":1,"prefix.b":2}
+
+SELECT json_add_prefix('{"user": {"name": "Alice"}, "count": 5}', 'data_');
+-- Result: {"data_user":{"name":"Alice"},"data_count":5}
+```
+
+Note: This function requires the input to be a JSON object. It will raise an error if given a JSON array or primitive value.
 
 ## Running the tests
 Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:

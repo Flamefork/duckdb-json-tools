@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark json_flatten extension function against flatten_json SQL macro.
+"""Benchmark json_add_prefix extension function against add_prefix_json SQL macro.
 
 The script orchestrates dataset preparation, correctness checks, repeated timing
 runs, and profiler capture for the scenarios defined in the benchmark plan.
@@ -18,9 +18,9 @@ from typing import Dict, List, Optional, Tuple
 import duckdb
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DB_PATH = PROJECT_ROOT / "bench" / "json_flatten_bench.duckdb"
-SETUP_SQL_PATH = PROJECT_ROOT / "bench" / "json_flatten_setup.sql"
-RESULTS_CSV_PATH = PROJECT_ROOT / "bench" / "results" / "json_flatten_vs_macro.csv"
+DEFAULT_DB_PATH = PROJECT_ROOT / "bench" / "json_add_prefix_bench.duckdb"
+SETUP_SQL_PATH = PROJECT_ROOT / "bench" / "json_add_prefix_setup.sql"
+RESULTS_CSV_PATH = PROJECT_ROOT / "bench" / "results" / "json_add_prefix_vs_macro.csv"
 PROFILES_ROOT = PROJECT_ROOT / "build" / "bench" / "profiles"
 
 PROFILER_SETTINGS = json.dumps({
@@ -30,40 +30,17 @@ PROFILER_SETTINGS = json.dumps({
 })
 
 JSON_MACRO_SQL = """
-CREATE OR REPLACE TEMP MACRO flatten_json(v) AS (
-    SELECT map(
-        list(replace(replace(replace(fullkey, '$.', ''), '[', '.'), ']', '')),
-        list(value)
-    )::JSON
-    FROM json_tree(v)
-    WHERE type NOT IN ('OBJECT', 'ARRAY')
+CREATE OR REPLACE TEMP MACRO add_prefix_json(v, prefix) AS (
+    json_object(
+        *
+        SELECT prefix || key AS k, value
+        FROM json_each(v)
+    )
 );
 """
 
-
-def load_json_tools_extension(connection: duckdb.DuckDBPyConnection) -> None:
-    """Load the locally built json_tools extension, falling back to direct file load."""
-
-    repo_root = PROJECT_ROOT / "build" / "release" / "repository"
-    repo_str = repo_root.as_posix()
-    try:
-        connection.execute(f"INSTALL json_tools FROM '{repo_str}'")
-        connection.execute("LOAD json_tools")
-        return
-    except duckdb.Error:
-        pass
-
-    candidates = sorted(repo_root.glob("**/json_tools.duckdb_extension"))
-    for candidate in candidates:
-        try:
-            connection.execute(f"LOAD '{candidate.as_posix()}'")
-            return
-        except duckdb.Error:
-            continue
-
-    raise RuntimeError(
-        "Unable to load json_tools extension from local build directory"
-    )
+# Standard prefix used across all benchmarks
+BENCHMARK_PREFIX = 'pr.'
 
 
 @dataclass(frozen=True)
@@ -130,14 +107,20 @@ def ensure_environment(connection: duckdb.DuckDBPyConnection, *, threads: int, m
 
 def verify_functional_parity(connection: duckdb.DuckDBPyConnection, scenario: Scenario) -> None:
     query = f"""
-        SELECT COUNT(*)
-        FROM {scenario.table_name}
-        WHERE json_flatten(payload) IS DISTINCT FROM flatten_json(payload);
+        WITH a AS (
+            SELECT json_add_prefix(payload, '{BENCHMARK_PREFIX}') AS v FROM {scenario.table_name}
+        ),
+        b AS (
+            SELECT add_prefix_json(payload, '{BENCHMARK_PREFIX}') AS v FROM {scenario.table_name}
+        )
+        SELECT
+            (SELECT COUNT(*) FROM (SELECT * FROM a EXCEPT ALL SELECT * FROM b)) AS diff_ab,
+            (SELECT COUNT(*) FROM (SELECT * FROM b EXCEPT ALL SELECT * FROM a)) AS diff_ba;
     """
-    mismatches = connection.execute(query).fetchone()[0]
-    if mismatches:
+    diff_ab, diff_ba = connection.execute(query).fetchone()
+    if diff_ab or diff_ba:
         raise RuntimeError(
-            f"Mismatch detected for scenario '{scenario.name}': {mismatches} rows differ"
+            f"Mismatch detected for scenario '{scenario.name}': diff_ab={diff_ab}, diff_ba={diff_ba}"
         )
 
 
@@ -145,9 +128,9 @@ def run_select(connection: duckdb.DuckDBPyConnection, select_sql: str, impl: str
     sink = "bench_tmp_sink"
     connection.execute(f"DROP TABLE IF EXISTS {sink};")
     target_sql = (
-        f"CREATE TEMP TABLE {sink} AS SELECT json_flatten(payload) AS payload FROM ({select_sql}) t"
-        if impl == "json_flatten"
-        else f"CREATE TEMP TABLE {sink} AS SELECT flatten_json(payload) AS payload FROM ({select_sql}) t"
+        f"CREATE TEMP TABLE {sink} AS SELECT json_add_prefix(payload, '{BENCHMARK_PREFIX}') AS payload FROM ({select_sql}) t"
+        if impl == "json_add_prefix"
+        else f"CREATE TEMP TABLE {sink} AS SELECT add_prefix_json(payload, '{BENCHMARK_PREFIX}') AS payload FROM ({select_sql}) t"
     )
     connection.execute(target_sql)
     connection.execute(f"DROP TABLE {sink};")
@@ -182,12 +165,12 @@ def benchmark_scenario(
     verify_functional_parity(connection, scenario)
 
     results: List[Dict[str, object]] = []
-    for impl_label in ("json_flatten", "flatten_json"):
+    for impl_label in ("json_add_prefix", "add_prefix_json"):
         if warmup:
             connection.execute("PRAGMA disable_profiling;")
             run_select(connection, scenario.select_sql, impl_label)
         for run_id in range(1, runs + 1):
-            profile_dir = PROFILES_ROOT / f"threads_{thread_count}" / scenario.name
+            profile_dir = PROFILES_ROOT / "json_add_prefix" / f"threads_{thread_count}" / scenario.name
             profile_dir.mkdir(parents=True, exist_ok=True)
             profile_path = profile_dir / f"{impl_label}_run{run_id}.json"
             connection.execute("PRAGMA disable_profiling;")
@@ -333,9 +316,11 @@ def main() -> None:
     args = parse_args()
     args.database.parent.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect(str(args.database), config={'allow_unsigned_extensions': 'true'})
+    local_repo = PROJECT_ROOT / 'build' / 'release' / 'repository'
     connection.execute("INSTALL json")
     connection.execute("LOAD json")
-    load_json_tools_extension(connection)
+    connection.execute(f"INSTALL json_tools FROM '{local_repo.as_posix()}'")
+    connection.execute("LOAD json_tools")
     connection.execute(JSON_MACRO_SQL)
 
     if not args.skip_setup:
