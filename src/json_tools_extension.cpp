@@ -57,6 +57,20 @@ static unique_ptr<FunctionLocalState> JsonFlattenInitLocalState(ExpressionState 
 	return make_uniq<JsonFlattenLocalState>(BufferAllocator::Get(context));
 }
 
+struct JsonAddPrefixLocalState : public FunctionLocalState {
+	explicit JsonAddPrefixLocalState(Allocator &allocator)
+	    : json_allocator(std::make_shared<JSONAllocator>(allocator)) {
+	}
+
+	shared_ptr<JSONAllocator> json_allocator;
+};
+
+static unique_ptr<FunctionLocalState> JsonAddPrefixInitLocalState(ExpressionState &state,
+	const BoundFunctionExpression &, FunctionData *) {
+	auto &context = state.GetContext();
+	return make_uniq<JsonAddPrefixLocalState>(BufferAllocator::Get(context));
+}
+
 using duckdb_yyjson::yyjson_arr_iter;
 using duckdb_yyjson::yyjson_arr_iter_next;
 using duckdb_yyjson::yyjson_arr_iter_with;
@@ -202,6 +216,93 @@ inline string_t JsonFlattenSingle(Vector &result, const string_t &input, JsonFla
 	return StringVector::AddString(result, output_cstr, output_length);
 }
 
+// Add prefix to all top-level keys in a JSON object.
+inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const string_t &prefix,
+                                     JSONAllocator &allocator) {
+	allocator.Reset();
+	auto alc = allocator.GetYYAlc();
+	auto input_data = input.GetDataUnsafe();
+	auto input_length = input.GetSize();
+	duckdb_yyjson::yyjson_read_err err;
+	auto doc = yyjson_read_opts(const_cast<char *>(input_data), input_length, duckdb_yyjson::YYJSON_READ_NOFLAG, alc,
+	                           &err);
+	if (!doc) {
+		throw InvalidInputException(StringUtil::Format("json_add_prefix: invalid JSON at position %llu: %s",
+		                                              static_cast<unsigned long long>(err.pos),
+		                                              err.msg ? err.msg : "unknown error"));
+	}
+
+	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc_handle(doc, yyjson_doc_free);
+	auto root = yyjson_doc_get_root(doc);
+	if (!root || !yyjson_is_obj(root)) {
+		throw InvalidInputException("json_add_prefix: expected JSON object input");
+	}
+
+	auto out_doc = yyjson_mut_doc_new(alc);
+	if (!out_doc) {
+		throw InternalException("json_add_prefix: failed to allocate output document");
+	}
+	std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> out_handle(out_doc, yyjson_mut_doc_free);
+	auto out_root = yyjson_mut_obj(out_doc);
+	if (!out_root) {
+		throw InternalException("json_add_prefix: failed to allocate output object");
+	}
+	yyjson_mut_doc_set_root(out_doc, out_root);
+
+	auto prefix_data = prefix.GetDataUnsafe();
+	auto prefix_length = prefix.GetSize();
+
+	yyjson_val *key;
+	yyjson_obj_iter iter = yyjson_obj_iter_with(root);
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		auto value = yyjson_obj_iter_get_val(key);
+		auto key_str = duckdb_yyjson::yyjson_get_str(key);
+		auto key_len = duckdb_yyjson::yyjson_get_len(key);
+
+		// Construct prefixed key using stack buffer for common case
+		char buffer[512];
+		size_t prefixed_len = prefix_length + key_len;
+		yyjson_mut_val *new_key_val;
+
+		if (prefixed_len < sizeof(buffer)) {
+			// Use stack buffer for common case
+			memcpy(buffer, prefix_data, prefix_length);
+			memcpy(buffer + prefix_length, key_str, key_len);
+			new_key_val = yyjson_mut_strncpy(out_doc, buffer, prefixed_len);
+		} else {
+			// Fallback to heap for large keys
+			std::string new_key;
+			new_key.reserve(prefixed_len);
+			new_key.append(prefix_data, prefix_length);
+			new_key.append(key_str, key_len);
+			new_key_val = yyjson_mut_strncpy(out_doc, new_key.c_str(), prefixed_len);
+		}
+
+		if (!new_key_val) {
+			throw InternalException("json_add_prefix: failed to allocate key storage");
+		}
+		auto new_key_ptr = duckdb_yyjson::yyjson_mut_get_str(new_key_val);
+
+		auto value_copy = yyjson_val_mut_copy(out_doc, value);
+		if (!value_copy) {
+			throw InternalException("json_add_prefix: failed to allocate value storage");
+		}
+
+		if (!yyjson_mut_obj_add_val(out_doc, out_root, new_key_ptr, value_copy)) {
+			throw InternalException("json_add_prefix: failed to add prefixed key-value pair");
+		}
+	}
+
+	size_t output_length = 0;
+	auto output_cstr =
+	    yyjson_mut_write_opts(out_doc, duckdb_yyjson::YYJSON_WRITE_NOFLAG, nullptr, &output_length, nullptr);
+	if (!output_cstr) {
+		throw InternalException("json_add_prefix: failed to serialize output JSON");
+	}
+	std::unique_ptr<char, decltype(&free)> output_handle(output_cstr, free);
+	return StringVector::AddString(result, output_cstr, output_length);
+}
+
 } // namespace
 
 inline void JsonFlattenScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -215,11 +316,32 @@ inline void JsonFlattenScalarFun(DataChunk &args, ExpressionState &state, Vector
 	});
 }
 
+inline void JsonAddPrefixScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto state_ptr = ExecuteFunctionState::GetFunctionState(state);
+	D_ASSERT(state_ptr);
+	auto &local_state = state_ptr->Cast<JsonAddPrefixLocalState>();
+	auto &json_input = args.data[0];
+	auto &prefix_input = args.data[1];
+
+	BinaryExecutor::Execute<string_t, string_t, string_t>(
+	    json_input, prefix_input, result, args.size(),
+	    [&](const string_t &json, const string_t &prefix) {
+		    return JsonAddPrefixSingle(result, json, prefix, *local_state.json_allocator);
+	    });
+}
+
 static void LoadInternal(JsonToolsLoadContext &ctx) {
 	auto json_flatten_scalar_function = ScalarFunction("json_flatten", {LogicalType::JSON()}, LogicalType::JSON(),
 	                                                  JsonFlattenScalarFun, nullptr, nullptr, nullptr,
 	                                                  JsonFlattenInitLocalState);
 	RegisterScalarFunction(ctx, json_flatten_scalar_function);
+
+	auto json_add_prefix_scalar_function = ScalarFunction("json_add_prefix",
+	                                                      {LogicalType::JSON(), LogicalType::VARCHAR},
+	                                                      LogicalType::JSON(),
+	                                                      JsonAddPrefixScalarFun, nullptr, nullptr, nullptr,
+	                                                      JsonAddPrefixInitLocalState);
+	RegisterScalarFunction(ctx, json_add_prefix_scalar_function);
 }
 
 #if JSON_TOOLS_EXTENSION_HAS_LOADER

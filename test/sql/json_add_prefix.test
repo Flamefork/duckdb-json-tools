@@ -1,0 +1,226 @@
+# name: test/sql/json_add_prefix.test
+# description: json_add_prefix prepends a prefix to all top-level keys in a JSON object
+# group: [sql]
+
+require json_tools
+
+# Ensure helper constructors from the json extension are available
+require json
+
+# ========================================
+# Basic Behavior Tests
+# ========================================
+
+query I
+SELECT json_add_prefix('{"a": {"b": 1}, "c": 2}', 'pr.');
+----
+{"pr.a":{"b":1},"pr.c":2}
+
+query I
+SELECT json_add_prefix('{"x": 1, "y": 2}', 'stg.');
+----
+{"stg.x":1,"stg.y":2}
+
+query I
+SELECT json_add_prefix('{"key": "value"}', 'prefix_');
+----
+{"prefix_key":"value"}
+
+query I
+SELECT json_add_prefix('{"a": 1, "b": 2, "c": 3}', 'x');
+----
+{"xa":1,"xb":2,"xc":3}
+
+# ========================================
+# NULL Handling Tests
+# ========================================
+
+query I
+SELECT json_add_prefix(NULL, 'pr.');
+----
+NULL
+
+statement error
+SELECT json_add_prefix('null', 'pr.');
+----
+Invalid Input Error: json_add_prefix: expected JSON object input
+
+# ========================================
+# Empty Object Test
+# ========================================
+
+query I
+SELECT json_add_prefix('{}', 'pr.');
+----
+{}
+
+# ========================================
+# Non-Object Input Error Tests
+# ========================================
+
+statement error
+SELECT json_add_prefix('[1, 2, 3]', 'pr.');
+----
+Invalid Input Error: json_add_prefix: expected JSON object input
+
+statement error
+SELECT json_add_prefix('["x"]', 'pr.');
+----
+Invalid Input Error: json_add_prefix: expected JSON object input
+
+statement error
+SELECT json_add_prefix('42', 'pr.');
+----
+Invalid Input Error: json_add_prefix: expected JSON object input
+
+statement error
+SELECT json_add_prefix('"string"', 'pr.');
+----
+Invalid Input Error: json_add_prefix: expected JSON object input
+
+statement error
+SELECT json_add_prefix('true', 'pr.');
+----
+Invalid Input Error: json_add_prefix: expected JSON object input
+
+# ========================================
+# Malformed JSON Test
+# ========================================
+
+statement error
+SELECT json_add_prefix('{invalid}', 'pr.');
+----
+Conversion Error: Malformed JSON
+
+# ========================================
+# Unicode Prefix Tests
+# ========================================
+
+query I
+SELECT json_add_prefix('{"name": "test", "value": 42}', '中文_');
+----
+{"中文_name":"test","中文_value":42}
+
+query I
+SELECT json_add_prefix('{"x": 1}', '🔥');
+----
+{"🔥x":1}
+
+query I
+SELECT json_add_prefix('{"key": "value"}', 'Русский_');
+----
+{"Русский_key":"value"}
+
+query I
+SELECT json_add_prefix('{"test": 1}', 'العربية_');
+----
+{"العربية_test":1}
+
+# ========================================
+# Unicode Key Tests
+# ========================================
+
+query I
+SELECT json_add_prefix('{"中文": 1, "日本語": 2}', 'pr.');
+----
+{"pr.中文":1,"pr.日本語":2}
+
+query I
+SELECT json_add_prefix('{"🔥": "fire"}', 'emoji_');
+----
+{"emoji_🔥":"fire"}
+
+# ========================================
+# Nested Values Unchanged Tests
+# ========================================
+
+query I
+SELECT json_add_prefix('{"outer": {"inner": {"deep": 1}}}', 'pre_');
+----
+{"pre_outer":{"inner":{"deep":1}}}
+
+query I
+SELECT json_add_prefix('{"arr": [1, 2, {"nested": 3}]}', 'x_');
+----
+{"x_arr":[1,2,{"nested":3}]}
+
+query I
+SELECT json_add_prefix('{"a": [], "b": {}}', 'p_');
+----
+{"p_a":[],"p_b":{}}
+
+# ========================================
+# Key Collision Tests
+# ========================================
+
+query I
+SELECT json_add_prefix('{"a": 1, "pr.a": 2}', 'pr.');
+----
+{"pr.a":1,"pr.pr.a":2}
+
+query I
+SELECT json_add_prefix('{"x": 1, "xx": 2}', 'x');
+----
+{"xx":1,"xxx":2}
+
+# ========================================
+# Empty Key Tests
+# ========================================
+
+query I
+SELECT json_add_prefix('{"": 1}', 'pr.');
+----
+{"pr.":1}
+
+query I
+SELECT json_add_prefix('{"": "empty", "key": "value"}', 'x_');
+----
+{"x_":"empty","x_key":"value"}
+
+# ========================================
+# Empty Prefix Test
+# ========================================
+
+query I
+SELECT json_add_prefix('{"a": 1, "b": 2}', '');
+----
+{"a":1,"b":2}
+
+# ========================================
+# Special Characters in Prefix Tests
+# ========================================
+
+query I
+SELECT json_add_prefix('{"key": "value"}', 'prefix.with.dots.');
+----
+{"prefix.with.dots.key":"value"}
+
+query I
+SELECT json_add_prefix('{"key": "value"}', 'prefix-with-dashes-');
+----
+{"prefix-with-dashes-key":"value"}
+
+query I
+SELECT json_add_prefix('{"key": "value"}', 'prefix_with_underscores_');
+----
+{"prefix_with_underscores_key":"value"}
+
+# ========================================
+# Large Object Tests
+# ========================================
+
+query I
+WITH large AS (
+    SELECT json_add_prefix(
+        json_object(
+            'key0', 0, 'key1', 1, 'key2', 2, 'key3', 3, 'key4', 4,
+            'key5', 5, 'key6', 6, 'key7', 7, 'key8', 8, 'key9', 9
+        ),
+        'pre_'
+    ) AS prefixed
+)
+SELECT prefixed::VARCHAR LIKE '%"pre_key0":0%'
+   AND prefixed::VARCHAR LIKE '%"pre_key9":9%' AS valid
+FROM large;
+----
+true
