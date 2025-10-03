@@ -5,8 +5,7 @@
 require json_tools
 
 # Ensure helper constructors from the json extension are available
-statement ok
-LOAD json;
+require json
 
 # ========================================
 # Basic Behavior Tests
