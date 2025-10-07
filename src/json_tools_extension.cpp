@@ -43,16 +43,15 @@ static void RegisterScalarFunction(JsonToolsLoadContext &ctx, const ScalarFuncti
 #endif
 
 struct JsonFlattenLocalState : public FunctionLocalState {
-	explicit JsonFlattenLocalState(Allocator &allocator)
-	    : json_allocator(std::make_shared<JSONAllocator>(allocator)) {
+	explicit JsonFlattenLocalState(Allocator &allocator) : json_allocator(std::make_shared<JSONAllocator>(allocator)) {
 	}
 
 	shared_ptr<JSONAllocator> json_allocator;
 	std::string key_buffer;
 };
 
-static unique_ptr<FunctionLocalState> JsonFlattenInitLocalState(ExpressionState &state,
-	const BoundFunctionExpression &, FunctionData *) {
+static unique_ptr<FunctionLocalState> JsonFlattenInitLocalState(ExpressionState &state, const BoundFunctionExpression &,
+                                                                FunctionData *) {
 	auto &context = state.GetContext();
 	return make_uniq<JsonFlattenLocalState>(BufferAllocator::Get(context));
 }
@@ -66,7 +65,7 @@ struct JsonAddPrefixLocalState : public FunctionLocalState {
 };
 
 static unique_ptr<FunctionLocalState> JsonAddPrefixInitLocalState(ExpressionState &state,
-	const BoundFunctionExpression &, FunctionData *) {
+                                                                  const BoundFunctionExpression &, FunctionData *) {
 	auto &context = state.GetContext();
 	return make_uniq<JsonAddPrefixLocalState>(BufferAllocator::Get(context));
 }
@@ -121,10 +120,10 @@ static void AppendIndexToKeyBuffer(std::string &key_buffer, idx_t index) {
 
 // Depth-first traversal that materializes dotted key paths for leaf values.
 static void FlattenIntoObject(yyjson_val *node, yyjson_mut_doc *out_doc, yyjson_mut_val *out_obj,
-		std::string &key_buffer, idx_t depth = 0) {
+                              std::string &key_buffer, idx_t depth = 0) {
 	if (depth > MAX_JSON_NESTING_DEPTH) {
 		throw InvalidInputException("json_flatten: nesting depth exceeds maximum limit of " +
-		                           std::to_string(MAX_JSON_NESTING_DEPTH));
+		                            std::to_string(MAX_JSON_NESTING_DEPTH));
 	}
 	if (yyjson_is_obj(node)) {
 		yyjson_val *key;
@@ -180,12 +179,12 @@ inline string_t JsonFlattenSingle(Vector &result, const string_t &input, JsonFla
 	auto input_data = input.GetDataUnsafe();
 	auto input_length = input.GetSize();
 	duckdb_yyjson::yyjson_read_err err;
-	auto doc = yyjson_read_opts(const_cast<char *>(input_data), input_length, duckdb_yyjson::YYJSON_READ_NOFLAG, alc,
-	                           &err);
+	auto doc =
+	    yyjson_read_opts(const_cast<char *>(input_data), input_length, duckdb_yyjson::YYJSON_READ_NOFLAG, alc, &err);
 	if (!doc) {
 		throw InvalidInputException(StringUtil::Format("json_flatten: invalid JSON at position %llu: %s",
-		                                              static_cast<unsigned long long>(err.pos),
-		                                              err.msg ? err.msg : "unknown error"));
+		                                               static_cast<unsigned long long>(err.pos),
+		                                               err.msg ? err.msg : "unknown error"));
 	}
 	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc_handle(doc, yyjson_doc_free);
 	auto root = yyjson_doc_get_root(doc);
@@ -218,18 +217,18 @@ inline string_t JsonFlattenSingle(Vector &result, const string_t &input, JsonFla
 
 // Add prefix to all top-level keys in a JSON object.
 inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const string_t &prefix,
-                                     JSONAllocator &allocator) {
+                                    JSONAllocator &allocator) {
 	allocator.Reset();
 	auto alc = allocator.GetYYAlc();
 	auto input_data = input.GetDataUnsafe();
 	auto input_length = input.GetSize();
 	duckdb_yyjson::yyjson_read_err err;
-	auto doc = yyjson_read_opts(const_cast<char *>(input_data), input_length, duckdb_yyjson::YYJSON_READ_NOFLAG, alc,
-	                           &err);
+	auto doc =
+	    yyjson_read_opts(const_cast<char *>(input_data), input_length, duckdb_yyjson::YYJSON_READ_NOFLAG, alc, &err);
 	if (!doc) {
 		throw InvalidInputException(StringUtil::Format("json_add_prefix: invalid JSON at position %llu: %s",
-		                                              static_cast<unsigned long long>(err.pos),
-		                                              err.msg ? err.msg : "unknown error"));
+		                                               static_cast<unsigned long long>(err.pos),
+		                                               err.msg ? err.msg : "unknown error"));
 	}
 
 	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc_handle(doc, yyjson_doc_free);
@@ -324,23 +323,20 @@ inline void JsonAddPrefixScalarFun(DataChunk &args, ExpressionState &state, Vect
 	auto &prefix_input = args.data[1];
 
 	BinaryExecutor::Execute<string_t, string_t, string_t>(
-	    json_input, prefix_input, result, args.size(),
-	    [&](const string_t &json, const string_t &prefix) {
+	    json_input, prefix_input, result, args.size(), [&](const string_t &json, const string_t &prefix) {
 		    return JsonAddPrefixSingle(result, json, prefix, *local_state.json_allocator);
 	    });
 }
 
 static void LoadInternal(JsonToolsLoadContext &ctx) {
-	auto json_flatten_scalar_function = ScalarFunction("json_flatten", {LogicalType::JSON()}, LogicalType::JSON(),
-	                                                  JsonFlattenScalarFun, nullptr, nullptr, nullptr,
-	                                                  JsonFlattenInitLocalState);
+	auto json_flatten_scalar_function =
+	    ScalarFunction("json_flatten", {LogicalType::JSON()}, LogicalType::JSON(), JsonFlattenScalarFun, nullptr,
+	                   nullptr, nullptr, JsonFlattenInitLocalState);
 	RegisterScalarFunction(ctx, json_flatten_scalar_function);
 
-	auto json_add_prefix_scalar_function = ScalarFunction("json_add_prefix",
-	                                                      {LogicalType::JSON(), LogicalType::VARCHAR},
-	                                                      LogicalType::JSON(),
-	                                                      JsonAddPrefixScalarFun, nullptr, nullptr, nullptr,
-	                                                      JsonAddPrefixInitLocalState);
+	auto json_add_prefix_scalar_function =
+	    ScalarFunction("json_add_prefix", {LogicalType::JSON(), LogicalType::VARCHAR}, LogicalType::JSON(),
+	                   JsonAddPrefixScalarFun, nullptr, nullptr, nullptr, JsonAddPrefixInitLocalState);
 	RegisterScalarFunction(ctx, json_add_prefix_scalar_function);
 }
 
