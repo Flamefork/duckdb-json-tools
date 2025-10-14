@@ -13,6 +13,7 @@ This extension provides a set of utility functions to work with JSON data, focus
 
 - **`json_flatten(json)`**: Recursively flattens nested JSON objects and arrays into a single-level object with dot-separated keys.
 - **`json_add_prefix(json, text)`**: Adds a string prefix to every top-level key in a JSON object.
+- **`json_group_merge(json [ORDER BY ...])`**: Streams JSON patches with RFC 7396 merge semantics without materializing intermediate lists.
 
 ## Quick Start
 
@@ -112,10 +113,43 @@ SELECT json_add_prefix('{"user": {"name": "Alice"}, "count": 5}', 'data_');
 
 **Note:** This function requires the input to be a JSON object. It will raise an error if given a JSON array or primitive value.
 
+### `json_group_merge(json_expr [ORDER BY ...]) -> json`
+
+Applies a sequence of JSON patches using [RFC 7396](https://datatracker.ietf.org/doc/html/rfc7396) merge semantics. Inputs can be `JSON` values or `VARCHAR` text that parses as JSON. SQL `NULL` rows are skipped, and the aggregate returns `'{}'::json` when no non-null inputs are provided.
+
+Provide an `ORDER BY` clause to guarantee deterministic results—later rows in the ordered stream overwrite earlier keys, arrays replace wholesale, and `null` removes keys.
+
+**Grouped aggregation:**
+```sql
+SELECT session_id,
+       json_group_merge(patch ORDER BY event_ts) AS state
+FROM session_events
+GROUP BY session_id
+ORDER BY session_id;
+```
+
+**Window accumulation:**
+```sql
+SELECT customer_id,
+       event_ts,
+       json_group_merge(patch ORDER BY event_ts)
+           OVER (PARTITION BY customer_id
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS current_state
+FROM customer_patch_stream;
+```
+
+Use descending order when you want the newest patch first:
+```sql
+SELECT json_group_merge(patch ORDER BY version DESC) AS latest
+FROM config_history
+WHERE feature = 'search';
+```
+
 ## Error Handling
 
 - `json_flatten()` returns an error for malformed JSON
 - `json_add_prefix()` requires a JSON object (not array or primitive value)
+- `json_group_merge()` surfaces DuckDB JSON parse errors for invalid text and raises on merge buffers that exceed DuckDB limits
 - Maximum nesting depth: 1000 levels
 - Empty objects (`{}`) and arrays (`[]`) are omitted from flattened output
 
