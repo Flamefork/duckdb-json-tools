@@ -118,9 +118,8 @@ constexpr idx_t JSON_GROUP_MERGE_COMPACT_THRESHOLD = 1024;
 // Maximum nesting depth to prevent stack exhaustion from pathological inputs
 constexpr idx_t MAX_JSON_NESTING_DEPTH = 1000;
 
-static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base,
-                                                        yyjson_val *patch, idx_t depth,
-                                                        idx_t &replacements_since_compact);
+static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
+                                                        idx_t depth, idx_t &replacements_since_compact);
 
 static void JsonGroupMergeCompactState(JsonGroupMergeState &state) {
 	if (!state.doc || !state.doc->root) {
@@ -166,9 +165,8 @@ static void JsonGroupMergeApplyPatch(JsonGroupMergeState &state, yyjson_val *pat
 	JsonGroupMergeMaybeCompact(state);
 }
 
-static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base,
-                                                        yyjson_val *patch, idx_t depth,
-                                                        idx_t &replacements_since_compact) {
+static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
+                                                        idx_t depth, idx_t &replacements_since_compact) {
 	if (!patch) {
 		return base;
 	}
@@ -315,8 +313,7 @@ public:
 			return;
 		}
 		size_t output_length = 0;
-		auto output_cstr =
-		    yyjson_mut_write_opts(state.doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
+		auto output_cstr = yyjson_mut_write_opts(state.doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
 		if (!output_cstr) {
 			throw InternalException("json_group_merge: failed to serialize aggregate result");
 		}
@@ -355,16 +352,16 @@ using duckdb_yyjson::yyjson_mut_doc;
 using duckdb_yyjson::yyjson_mut_doc_free;
 using duckdb_yyjson::yyjson_mut_doc_new;
 using duckdb_yyjson::yyjson_mut_doc_set_root;
+using duckdb_yyjson::yyjson_mut_is_obj;
 using duckdb_yyjson::yyjson_mut_obj;
-using duckdb_yyjson::yyjson_mut_obj_add_val;
 using duckdb_yyjson::yyjson_mut_obj_add;
+using duckdb_yyjson::yyjson_mut_obj_add_val;
 using duckdb_yyjson::yyjson_mut_obj_getn;
 using duckdb_yyjson::yyjson_mut_obj_remove_keyn;
 using duckdb_yyjson::yyjson_mut_strncpy;
 using duckdb_yyjson::yyjson_mut_val;
-using duckdb_yyjson::yyjson_mut_write_opts;
 using duckdb_yyjson::yyjson_mut_val_mut_copy;
-using duckdb_yyjson::yyjson_mut_is_obj;
+using duckdb_yyjson::yyjson_mut_write_opts;
 using duckdb_yyjson::yyjson_obj_iter;
 using duckdb_yyjson::yyjson_obj_iter_get_val;
 using duckdb_yyjson::yyjson_obj_iter_next;
