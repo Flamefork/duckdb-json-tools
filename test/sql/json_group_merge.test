@@ -1,0 +1,163 @@
+# name: test/sql/json_group_merge.test
+# description: json_group_merge merges ordered JSON patches with RFC 7396 semantics
+# group: [sql]
+
+require json_tools
+
+# Ensure helper constructors from the json extension are available
+require json
+
+# ========================================
+# Basic Merge Semantics
+# ========================================
+
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"a":1}'::json, 1), ('{"b":2}'::json, 2)) AS t(patch, ts);
+----
+{"a":1,"b":2}
+
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"obj":{"x":1}}'::json, 1), ('{"obj":{"y":2}}'::json, 2)) AS t(patch, ts);
+----
+{"obj":{"x":1,"y":2}}
+
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"arr":[1,2]}'::json, 1), ('{"arr":[3]}'::json, 2)) AS t(patch, ts);
+----
+{"arr":[3]}
+
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"flag":true}'::json, 1), ('{"flag":false}'::json, 2)) AS t(patch, ts);
+----
+{"flag":false}
+
+# ========================================
+# NULL Handling
+# ========================================
+
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES (NULL::json, 1), ('{"keep":1}'::json, 2)) AS t(patch, ts);
+----
+{"keep":1}
+
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES (NULL::json, 1)) AS t(patch, ts);
+----
+{}
+
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"keep":1}'::json, 1), ('{"keep":null}'::json, 2)) AS t(patch, ts);
+----
+{}
+
+# ========================================
+# VARCHAR Input Support
+# ========================================
+
+query I
+SELECT json_group_merge(payload ORDER BY ts)
+FROM (VALUES ('{"source":"varchar"}', 1)) AS t(payload, ts);
+----
+{"source":"varchar"}
+
+# ========================================
+# Ordering Behaviour
+# ========================================
+
+query I
+SELECT json_group_merge(patch ORDER BY ts ASC)
+FROM (VALUES ('{"value":"first"}'::json, 1), ('{"value":"second"}'::json, 2)) AS t(patch, ts);
+----
+{"value":"second"}
+
+query I
+SELECT json_group_merge(patch ORDER BY ts DESC)
+FROM (VALUES ('{"value":"first"}'::json, 1), ('{"value":"second"}'::json, 2)) AS t(patch, ts);
+----
+{"value":"first"}
+
+query I
+SELECT json_group_merge(patch ORDER BY -ts)
+FROM (VALUES ('{"v":1}'::json, 1), ('{"v":2}'::json, 2), ('{"v":3}'::json, 3)) AS t(patch, ts);
+----
+{"v":1}
+
+# ========================================
+# Grouped Aggregation
+# ========================================
+
+query II
+SELECT session_id, json_group_merge(patch ORDER BY ts)
+FROM (VALUES
+    ('alpha', 1, '{"state":{"stage":1}}'::json),
+    ('alpha', 2, '{"state":{"stage":2}}'::json),
+    ('beta', 1, '{"state":{"mode":"dark"}}'::json),
+    ('beta', 3, '{"state":{"mode":"light"}}'::json)
+) AS t(session_id, ts, patch)
+GROUP BY session_id
+ORDER BY session_id;
+----
+alpha	{"state":{"stage":2}}
+beta	{"state":{"mode":"light"}}
+
+# ========================================
+# Window Aggregation
+# ========================================
+
+query IT
+SELECT seq,
+       json_group_merge(patch ORDER BY seq)
+           OVER (PARTITION BY grp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM (VALUES
+    (1, 'A', '{"score":1}'::json),
+    (2, 'A', '{"score":2}'::json),
+    (3, 'A', '{"bonus":true}'::json),
+    (1, 'B', '{"score":5}'::json),
+    (2, 'B', '{"score":7}'::json)
+) AS t(seq, grp, patch)
+ORDER BY grp, seq;
+----
+1	{"score":1}
+2	{"score":2}
+3	{"score":2,"bonus":true}
+1	{"score":5}
+2	{"score":7}
+
+# ========================================
+# Nested Merge, Removal, and Replacement
+# ========================================
+
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES
+    ('{"settings":{"theme":"light","options":{"font":"sans","color":"blue"}}}'::json, 1),
+    ('{"settings":{"options":{"color":"red"},"extra":true}}'::json, 2),
+    ('{"settings":{"options":{"font":null}}}'::json, 3)
+) AS t(patch, ts);
+----
+{"settings":{"theme":"light","options":{"color":"red"},"extra":true}}
+
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES
+    ('{"result":{"status":"pending"}}'::json, 1),
+    ('"complete"'::json, 2)
+) AS t(patch, ts);
+----
+"complete"
+
+# ========================================
+# Error Handling
+# ========================================
+
+statement error
+SELECT json_group_merge('{');
+----
+Invalid Input Error: json_group_merge: Malformed JSON at byte 1 of input: unexpected end of data.  Input: "{"

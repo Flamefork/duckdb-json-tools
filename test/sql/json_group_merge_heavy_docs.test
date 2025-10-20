@@ -1,0 +1,432 @@
+# name: test/sql/json_group_merge_heavy_docs.test
+# description: heavy benchmark payload builders stay valid and mergeable as complexity grows
+# group: [sql]
+
+require json_tools
+
+require json
+
+# Validate the wide JSON builder produces the expected number of keys
+query I
+WITH params AS (
+        SELECT
+            32 AS top_level_keys,
+            3 AS complexity_tiers,
+            4 AS nested_repeat_count
+    ),
+    base AS (
+        SELECT
+            0 AS session_id,
+            event_index,
+            event_index AS seq,
+            to_timestamp(1730000000 + event_index) AS event_ts,
+            FALSE AS mark_null
+        FROM range(0, 3) events(event_index)
+    ),
+    payloads AS (
+        SELECT
+            b.event_index,
+            json_group_object(
+                printf('field_%03d', attr_idx),
+                CASE
+                    WHEN attr_idx % 5 = 0 THEN json_object(
+                        'counters', json_object(
+                            'seq_mod', b.seq % 4096,
+                            'attr_idx', attr_idx,
+                            'rolling', (b.seq / (attr_idx + 1))::BIGINT
+                        ),
+                        'flags', json_array(
+                            (b.seq + attr_idx) % 2 = 0,
+                            (b.session_id + attr_idx) % 3 = 0,
+                            (b.event_index + attr_idx) % 5 = 0
+                        ),
+                        'labels', json_array(
+                            printf('session_%03d', b.session_id % 128),
+                            printf('event_%03d', b.event_index % 256),
+                            printf('attr_%03d', attr_idx)
+                        )
+                    )
+                    WHEN attr_idx % 5 = 1 THEN json_array(
+                        json_object(
+                            'type', 'metric',
+                            'name', printf('m_%03d', attr_idx),
+                            'value', (b.seq % 100000) * 0.0001
+                        ),
+                        json_object(
+                            'type', 'window',
+                            'start', (b.event_ts::TIMESTAMP) - (attr_idx % 6) * INTERVAL '15 minutes',
+                            'end', b.event_ts::TIMESTAMP
+                        ),
+                        json_object(
+                            'type', 'breakdown',
+                            'bins', to_json(
+                                list_transform(range(0, params.nested_repeat_count), i ->
+                                    struct_pack(
+                                        bucket := printf('bin_%02d', (attr_idx + i) % 64),
+                                        hits := (b.seq + i * (attr_idx + 1)) % 8192,
+                                        active := ((b.seq + attr_idx + i) % 3) = 0
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    WHEN attr_idx % 5 = 2 THEN json_object(
+                        'state', json_object(
+                            'level1', json_object(
+                                'level2', json_object(
+                                    'level3', json_object(
+                                        'level4', json_object(
+                                        'checksum', printf('chk_%08x', b.seq * 131 + attr_idx * 17),
+                                            'updated_at', b.event_ts::TIMESTAMP,
+                                            'tier', CASE
+                                                WHEN attr_idx % params.complexity_tiers = 0 THEN 'platinum'
+                                                WHEN attr_idx % params.complexity_tiers = 1 THEN 'gold'
+                                                WHEN attr_idx % params.complexity_tiers = 2 THEN 'silver'
+                                                ELSE 'bronze'
+                                            END
+                                        ),
+                                        'guards', json_array(
+                                            (attr_idx + 1) % 2 = 0,
+                                            (attr_idx + b.session_id) % 3 = 0,
+                                            (attr_idx + b.event_index) % 5 = 0
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    WHEN attr_idx % 5 = 3 THEN to_json(
+                        list_transform(range(0, params.complexity_tiers * 2), lvl ->
+                            struct_pack(
+                                layer := lvl,
+                                time_window := struct_pack(
+                                    start := (b.event_ts::TIMESTAMP) - lvl * INTERVAL '10 minutes',
+                                    finish := b.event_ts::TIMESTAMP
+                                ),
+                                samples := list_transform(range(0, params.nested_repeat_count), s ->
+                                        struct_pack(
+                                        idx := s,
+                                        score := ((b.seq + attr_idx + lvl * 7 + s) % 1000) * 0.01,
+                                        tag := printf('s_%02d', (attr_idx + s) % 80)
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    ELSE json_object(
+                        'meta', json_object(
+                            'session_key', printf('sess_%05d', b.session_id),
+                            'event_key', printf('evt_%05d', b.event_index),
+                            'carrier', printf('carrier_%02d', (b.session_id + attr_idx) % 17),
+                            'complexity', params.complexity_tiers
+                        ),
+                        'overrides', json_array(
+                            json_object(
+                                'path', printf('state.field_%03d.threshold', attr_idx),
+                                'value', (b.seq + attr_idx) % 1024
+                            ),
+                            json_object(
+                                'path', 'metrics.primary',
+                                'value', (b.seq * (attr_idx + 1)) % 2048
+                            )
+                        ),
+                        'notes', printf('note_%03d_%03d', b.seq % 1000, attr_idx)
+                    )
+                END
+            ) AS payload
+        FROM base b
+        CROSS JOIN params
+        CROSS JOIN range(0, params.top_level_keys) attr(attr_idx)
+        GROUP BY b.session_id, b.event_index, b.event_ts, b.seq, b.mark_null
+    )
+SELECT json_array_length(json_keys(payload)) AS top_key_count
+FROM payloads
+WHERE event_index = 1;
+----
+32
+
+# The nested bins array should scale with the configured repeat count
+query I
+WITH params AS (
+        SELECT
+            32 AS top_level_keys,
+            3 AS complexity_tiers,
+            4 AS nested_repeat_count
+    ),
+    base AS (
+        SELECT
+            0 AS session_id,
+            event_index,
+            event_index AS seq,
+            to_timestamp(1730000000 + event_index) AS event_ts,
+            FALSE AS mark_null
+        FROM range(0, 3) events(event_index)
+    ),
+    payloads AS (
+        SELECT
+            b.event_index,
+            json_group_object(
+                printf('field_%03d', attr_idx),
+                CASE
+                    WHEN attr_idx % 5 = 0 THEN json_object(
+                        'counters', json_object(
+                            'seq_mod', b.seq % 4096,
+                            'attr_idx', attr_idx,
+                            'rolling', (b.seq / (attr_idx + 1))::BIGINT
+                        ),
+                        'flags', json_array(
+                            (b.seq + attr_idx) % 2 = 0,
+                            (b.session_id + attr_idx) % 3 = 0,
+                            (b.event_index + attr_idx) % 5 = 0
+                        ),
+                        'labels', json_array(
+                            printf('session_%03d', b.session_id % 128),
+                            printf('event_%03d', b.event_index % 256),
+                            printf('attr_%03d', attr_idx)
+                        )
+                    )
+                    WHEN attr_idx % 5 = 1 THEN json_array(
+                        json_object(
+                            'type', 'metric',
+                            'name', printf('m_%03d', attr_idx),
+                            'value', (b.seq % 100000) * 0.0001
+                        ),
+                        json_object(
+                            'type', 'window',
+                            'start', (b.event_ts::TIMESTAMP) - (attr_idx % 6) * INTERVAL '15 minutes',
+                            'end', b.event_ts::TIMESTAMP
+                        ),
+                        json_object(
+                            'type', 'breakdown',
+                            'bins', to_json(
+                                list_transform(range(0, params.nested_repeat_count), i ->
+                                    struct_pack(
+                                        bucket := printf('bin_%02d', (attr_idx + i) % 64),
+                                        hits := (b.seq + i * (attr_idx + 1)) % 8192,
+                                        active := ((b.seq + attr_idx + i) % 3) = 0
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    WHEN attr_idx % 5 = 2 THEN json_object(
+                        'state', json_object(
+                            'level1', json_object(
+                                'level2', json_object(
+                                    'level3', json_object(
+                                        'level4', json_object(
+                                        'checksum', printf('chk_%08x', b.seq * 131 + attr_idx * 17),
+                                            'updated_at', b.event_ts::TIMESTAMP,
+                                            'tier', CASE
+                                                WHEN attr_idx % params.complexity_tiers = 0 THEN 'platinum'
+                                                WHEN attr_idx % params.complexity_tiers = 1 THEN 'gold'
+                                                WHEN attr_idx % params.complexity_tiers = 2 THEN 'silver'
+                                                ELSE 'bronze'
+                                            END
+                                        ),
+                                        'guards', json_array(
+                                            (attr_idx + 1) % 2 = 0,
+                                            (attr_idx + b.session_id) % 3 = 0,
+                                            (attr_idx + b.event_index) % 5 = 0
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    WHEN attr_idx % 5 = 3 THEN to_json(
+                        list_transform(range(0, params.complexity_tiers * 2), lvl ->
+                            struct_pack(
+                                layer := lvl,
+                                time_window := struct_pack(
+                                    start := (b.event_ts::TIMESTAMP) - lvl * INTERVAL '10 minutes',
+                                    finish := b.event_ts::TIMESTAMP
+                                ),
+                                samples := list_transform(range(0, params.nested_repeat_count), s ->
+                                        struct_pack(
+                                        idx := s,
+                                        score := ((b.seq + attr_idx + lvl * 7 + s) % 1000) * 0.01,
+                                        tag := printf('s_%02d', (attr_idx + s) % 80)
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    ELSE json_object(
+                        'meta', json_object(
+                            'session_key', printf('sess_%05d', b.session_id),
+                            'event_key', printf('evt_%05d', b.event_index),
+                            'carrier', printf('carrier_%02d', (b.session_id + attr_idx) % 17),
+                            'complexity', params.complexity_tiers
+                        ),
+                        'overrides', json_array(
+                            json_object(
+                                'path', printf('state.field_%03d.threshold', attr_idx),
+                                'value', (b.seq + attr_idx) % 1024
+                            ),
+                            json_object(
+                                'path', 'metrics.primary',
+                                'value', (b.seq * (attr_idx + 1)) % 2048
+                            )
+                        ),
+                        'notes', printf('note_%03d_%03d', b.seq % 1000, attr_idx)
+                    )
+                END
+            ) AS payload
+        FROM base b
+        CROSS JOIN params
+        CROSS JOIN range(0, params.top_level_keys) attr(attr_idx)
+        GROUP BY b.session_id, b.event_index, b.event_ts, b.seq, b.mark_null
+    )
+SELECT json_array_length(json_extract(payload, '$."field_001"[2].bins')) AS bin_count
+FROM payloads
+WHERE event_index = 1;
+----
+4
+
+# Ensure json_group_merge can merge the heavy patches and reflect the latest metadata
+query T
+WITH params AS (
+        SELECT
+            32 AS top_level_keys,
+            3 AS complexity_tiers,
+            4 AS nested_repeat_count
+    ),
+    base AS (
+        SELECT
+            0 AS session_id,
+            event_index,
+            event_index AS seq,
+            to_timestamp(1730000000 + event_index) AS event_ts,
+            FALSE AS mark_null
+        FROM range(0, 3) events(event_index)
+    ),
+    payloads AS (
+        SELECT
+            b.event_index,
+            json_group_object(
+                printf('field_%03d', attr_idx),
+                CASE
+                    WHEN attr_idx % 5 = 0 THEN json_object(
+                        'counters', json_object(
+                            'seq_mod', b.seq % 4096,
+                            'attr_idx', attr_idx,
+                            'rolling', (b.seq / (attr_idx + 1))::BIGINT
+                        ),
+                        'flags', json_array(
+                            (b.seq + attr_idx) % 2 = 0,
+                            (b.session_id + attr_idx) % 3 = 0,
+                            (b.event_index + attr_idx) % 5 = 0
+                        ),
+                        'labels', json_array(
+                            printf('session_%03d', b.session_id % 128),
+                            printf('event_%03d', b.event_index % 256),
+                            printf('attr_%03d', attr_idx)
+                        )
+                    )
+                    WHEN attr_idx % 5 = 1 THEN json_array(
+                        json_object(
+                            'type', 'metric',
+                            'name', printf('m_%03d', attr_idx),
+                            'value', (b.seq % 100000) * 0.0001
+                        ),
+                        json_object(
+                            'type', 'window',
+                            'start', (b.event_ts::TIMESTAMP) - (attr_idx % 6) * INTERVAL '15 minutes',
+                            'end', b.event_ts::TIMESTAMP
+                        ),
+                        json_object(
+                            'type', 'breakdown',
+                            'bins', to_json(
+                                list_transform(range(0, params.nested_repeat_count), i ->
+                                    struct_pack(
+                                        bucket := printf('bin_%02d', (attr_idx + i) % 64),
+                                        hits := (b.seq + i * (attr_idx + 1)) % 8192,
+                                        active := ((b.seq + attr_idx + i) % 3) = 0
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    WHEN attr_idx % 5 = 2 THEN json_object(
+                        'state', json_object(
+                            'level1', json_object(
+                                'level2', json_object(
+                                    'level3', json_object(
+                                        'level4', json_object(
+                                        'checksum', printf('chk_%08x', b.seq * 131 + attr_idx * 17),
+                                            'updated_at', b.event_ts::TIMESTAMP,
+                                            'tier', CASE
+                                                WHEN attr_idx % params.complexity_tiers = 0 THEN 'platinum'
+                                                WHEN attr_idx % params.complexity_tiers = 1 THEN 'gold'
+                                                WHEN attr_idx % params.complexity_tiers = 2 THEN 'silver'
+                                                ELSE 'bronze'
+                                            END
+                                        ),
+                                        'guards', json_array(
+                                            (attr_idx + 1) % 2 = 0,
+                                            (attr_idx + b.session_id) % 3 = 0,
+                                            (attr_idx + b.event_index) % 5 = 0
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    WHEN attr_idx % 5 = 3 THEN to_json(
+                        list_transform(range(0, params.complexity_tiers * 2), lvl ->
+                            struct_pack(
+                                layer := lvl,
+                                time_window := struct_pack(
+                                    start := (b.event_ts::TIMESTAMP) - lvl * INTERVAL '10 minutes',
+                                    finish := b.event_ts::TIMESTAMP
+                                ),
+                                samples := list_transform(range(0, params.nested_repeat_count), s ->
+                                        struct_pack(
+                                        idx := s,
+                                        score := ((b.seq + attr_idx + lvl * 7 + s) % 1000) * 0.01,
+                                        tag := printf('s_%02d', (attr_idx + s) % 80)
+                                    )
+                                )
+                            )
+                        )
+                    )
+                    ELSE json_object(
+                        'meta', json_object(
+                            'session_key', printf('sess_%05d', b.session_id),
+                            'event_key', printf('evt_%05d', b.event_index),
+                            'carrier', printf('carrier_%02d', (b.session_id + attr_idx) % 17),
+                            'complexity', params.complexity_tiers
+                        ),
+                        'overrides', json_array(
+                            json_object(
+                                'path', printf('state.field_%03d.threshold', attr_idx),
+                                'value', (b.seq + attr_idx) % 1024
+                            ),
+                            json_object(
+                                'path', 'metrics.primary',
+                                'value', (b.seq * (attr_idx + 1)) % 2048
+                            )
+                        ),
+                        'notes', printf('note_%03d_%03d', b.seq % 1000, attr_idx)
+                    )
+                END
+            ) AS payload
+        FROM base b
+        CROSS JOIN params
+        CROSS JOIN range(0, params.top_level_keys) attr(attr_idx)
+        GROUP BY b.session_id, b.event_index, b.event_ts, b.seq, b.mark_null
+    ),
+    merged AS (
+        SELECT json_group_merge(payload ORDER BY event_index) AS merged_doc FROM payloads
+    )
+SELECT
+    json_object(
+        'event',
+        json_extract(merged_doc, '$."field_004".meta.event_key'),
+        'tier',
+        json_extract(merged_doc, '$."field_002".state.level1.level2.level3.level4.tier')
+    )::VARCHAR
+FROM merged;
+----
+{"event":"evt_00002","tier":"silver"}
