@@ -430,3 +430,13 @@ SELECT
 FROM merged;
 ----
 {"event":"evt_00002","tier":"silver"}
+
+# IGNORE NULLS should preserve nested values in heavy payloads
+query I
+SELECT json_group_merge(payload, 'IGNORE NULLS' ORDER BY seq)
+FROM (VALUES
+    (0, '{"levels":{"one":{"two":{"keep":"value","drop":[1,2,3]}}},"metrics":{"baseline":5}}'::json),
+    (1, '{"levels":{"one":{"two":{"drop":null,"extra":999}}},"metrics":{"baseline":10,"latest":20}}'::json)
+) AS t(seq, payload);
+----
+{"levels":{"one":{"two":{"keep":"value","drop":[1,2,3],"extra":999}}},"metrics":{"baseline":10,"latest":20}}
