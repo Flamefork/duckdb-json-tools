@@ -113,11 +113,16 @@ SELECT json_add_prefix('{"user": {"name": "Alice"}, "count": 5}', 'data_');
 
 **Note:** This function requires the input to be a JSON object. It will raise an error if given a JSON array or primitive value.
 
-### `json_group_merge(json_expr [ORDER BY ...]) -> json`
+### `json_group_merge(json_expr [, treat_null_values] [ORDER BY ...]) -> json`
 
 Applies a sequence of JSON patches using [RFC 7396](https://datatracker.ietf.org/doc/html/rfc7396) merge semantics. Inputs can be `JSON` values or `VARCHAR` text that parses as JSON. SQL `NULL` rows are skipped, and the aggregate returns `'{}'::json` when no non-null inputs are provided.
 
-Provide an `ORDER BY` clause to guarantee deterministic results—later rows in the ordered stream overwrite earlier keys, arrays replace wholesale, and `null` removes keys.
+Provide an `ORDER BY` clause to guarantee deterministic results—later rows in the ordered stream overwrite earlier keys, arrays replace wholesale, and `null` removes keys. Pass the optional `treat_null_values` argument to override how object members set to JSON `null` are handled:
+
+- `DELETE NULLS` *(default)* — object members set to `null` delete the key.
+- `IGNORE NULLS` — `null` members are dropped before merging, so existing keys stay untouched. Null members in the first patch are also skipped (never seed keys with null values).
+
+The `treat_null_values` argument must be a constant `VARCHAR` literal (case-insensitive, surrounding whitespace ignored).
 
 **Grouped aggregation:**
 ```sql
@@ -143,6 +148,16 @@ Use descending order when you want the newest patch first:
 SELECT json_group_merge(patch ORDER BY version DESC) AS latest
 FROM config_history
 WHERE feature = 'search';
+```
+
+Toggle the null handling mode when sparse streams should ignore deletes:
+```sql
+SELECT json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES ('{"keep":1}'::json, 1), ('{"keep":null}'::json, 2)) AS t(patch, ts);
+```
+*Result:*
+```json
+{"keep":1}
 ```
 
 ## Error Handling

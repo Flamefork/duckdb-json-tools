@@ -58,6 +58,105 @@ FROM (VALUES ('{"keep":1}'::json, 1), ('{"keep":null}'::json, 2)) AS t(patch, ts
 {}
 
 # ========================================
+# treat_null_values Parameter
+# ========================================
+
+query I
+SELECT json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES ('{"keep":1}'::json, 1), ('{"keep":null}'::json, 2)) AS t(patch, ts);
+----
+{"keep":1}
+
+query I
+SELECT json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES ('{"keep":1,"drop":null}'::json, 1)) AS t(patch, ts);
+----
+{"keep":1}
+
+query I
+SELECT json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES ('{"outer":{"drop":null}}'::json, 1)) AS t(patch, ts);
+----
+{}
+
+query I
+SELECT json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES
+    ('{"outer":{"drop":10,"keep":5}}'::json, 1),
+    ('{"outer":{"drop":null,"keep":7}}'::json, 2)
+) AS t(patch, ts);
+----
+{"outer":{"drop":10,"keep":7}}
+
+query I
+SELECT json_group_merge(patch, '  delete nulls  ' ORDER BY ts)
+FROM (VALUES ('{"keep":1}'::json, 1), ('{"keep":null}'::json, 2)) AS t(patch, ts);
+----
+{}
+
+statement error
+SELECT json_group_merge(patch, 'DROP' ORDER BY ts)
+FROM (VALUES ('{"keep":1}'::json, 1)) AS t(patch, ts);
+----
+Invalid Input Error: json_group_merge: treat_null_values must be one of DELETE NULLS, IGNORE NULLS
+
+statement error
+SELECT json_group_merge(patch, NULL ORDER BY ts)
+FROM (VALUES ('{"keep":1}'::json, 1)) AS t(patch, ts);
+----
+Invalid Input Error: json_group_merge: treat_null_values must be one of DELETE NULLS, IGNORE NULLS
+
+statement error
+SELECT json_group_merge(patch, mode ORDER BY patch)
+FROM (VALUES ('{"keep":1}'::json, 'IGNORE NULLS')) AS t(patch, mode);
+----
+Binder Error: json_group_merge treat_null_values argument must be constant
+
+query I
+SELECT json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES ('{"a":1}', 1), ('{"a":null}', 2)) AS t(patch, ts);
+----
+{"a":1}
+
+query II
+SELECT grp, json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES ('A', 1, '{"x":1}'::json), ('A', 2, '{"x":null}'::json)) AS t(grp, ts, patch)
+GROUP BY grp;
+----
+A	{"x":1}
+
+# Edge cases for IGNORE NULLS
+
+query I
+SELECT json_group_merge('{}', 'IGNORE NULLS');
+----
+{}
+
+query I
+SELECT json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES ('{"a":null}'::json, 1), ('{"b":null}'::json, 2)) AS t(patch, ts);
+----
+{}
+
+query I
+SELECT json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES
+    ('{"a":{"b":{"c":{"d":1}}}}'::json, 1),
+    ('{"a":{"b":{"c":null}}}'::json, 2)
+) AS t(patch, ts);
+----
+{"a":{"b":{"c":{"d":1}}}}
+
+query I
+SELECT json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES
+    ('{"a":{"b":{"c":1}}}'::json, 1),
+    ('{"a":{"b":null}}'::json, 2)
+) AS t(patch, ts);
+----
+{"a":{"b":{"c":1}}}
+
+# ========================================
 # VARCHAR Input Support
 # ========================================
 
