@@ -186,7 +186,7 @@ static void JsonGroupMergeApplyPatch(JsonGroupMergeState &state, yyjson_val *pat
 	}
 	auto base_root = state.has_input ? state.doc->root : nullptr;
 	auto merged_root = JsonGroupMergeApplyPatchInternal(state.doc, base_root, patch_root, 0,
-	                                                   state.replacements_since_compact, null_treatment);
+	                                                    state.replacements_since_compact, null_treatment);
 	if (!merged_root) {
 		throw InternalException("json_group_merge: failed to merge JSON documents");
 	}
@@ -267,9 +267,8 @@ static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyj
 
 		auto existing_child = result ? duckdb_yyjson::yyjson_mut_obj_getn(result, key_str, key_len) : nullptr;
 		if (duckdb_yyjson::yyjson_is_obj(patch_val)) {
-			auto merged_child =
-			    JsonGroupMergeApplyPatchInternal(doc, existing_child, patch_val, depth + 1,
-			                                  replacements_since_compact, null_treatment);
+			auto merged_child = JsonGroupMergeApplyPatchInternal(doc, existing_child, patch_val, depth + 1,
+			                                                     replacements_since_compact, null_treatment);
 			// Skip if merged_child is null (can happen with IGNORE_NULLS when patch contains only nulls
 			// and there's no existing value)
 			if (!merged_child) {
@@ -372,7 +371,7 @@ public:
 			return;
 		}
 		JsonGroupMergeApplyPatch(target, reinterpret_cast<yyjson_val *>(source.doc->root),
-		                       GetNullTreatment(aggr_input_data.bind_data));
+		                         GetNullTreatment(aggr_input_data.bind_data));
 	}
 
 	template <class RESULT_TYPE, class STATE>
@@ -408,7 +407,8 @@ static string JsonGroupMergeNullOptionsText() {
 static unique_ptr<FunctionData> JsonGroupMergeBind(ClientContext &context, AggregateFunction &function,
                                                    vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.empty() || arguments.size() > 2) {
-		throw BinderException("json_group_merge expects one JSON argument plus an optional treat_null_values parameter");
+		throw BinderException(
+		    "json_group_merge expects one JSON argument plus an optional treat_null_values parameter");
 	}
 	auto treatment = JsonNullTreatment::DELETE_NULLS;
 	if (arguments.size() == 2) {
@@ -422,7 +422,7 @@ static unique_ptr<FunctionData> JsonGroupMergeBind(ClientContext &context, Aggre
 		auto mode_value = ExpressionExecutor::EvaluateScalar(context, *mode_arg);
 		if (mode_value.IsNull()) {
 			throw InvalidInputException("json_group_merge: treat_null_values must be one of %s",
-			                           JsonGroupMergeNullOptionsText().c_str());
+			                            JsonGroupMergeNullOptionsText().c_str());
 		}
 		if (mode_value.type().id() != LogicalTypeId::VARCHAR) {
 			throw BinderException("json_group_merge treat_null_values must be a VARCHAR literal");
@@ -434,7 +434,7 @@ static unique_ptr<FunctionData> JsonGroupMergeBind(ClientContext &context, Aggre
 			treatment = JsonNullTreatment::IGNORE_NULLS;
 		} else {
 			throw InvalidInputException("json_group_merge: treat_null_values must be one of %s",
-			                           JsonGroupMergeNullOptionsText().c_str());
+			                            JsonGroupMergeNullOptionsText().c_str());
 		}
 		Function::EraseArgument(function, arguments, 1);
 	}
