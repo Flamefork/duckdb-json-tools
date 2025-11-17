@@ -5,6 +5,8 @@
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -21,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -83,6 +86,19 @@ static unique_ptr<FunctionLocalState> JsonAddPrefixInitLocalState(ExpressionStat
                                                                   const BoundFunctionExpression &, FunctionData *) {
 	auto &context = state.GetContext();
 	return make_uniq<JsonAddPrefixLocalState>(BufferAllocator::Get(context));
+}
+
+struct JsonEntriesLocalState : public FunctionLocalState {
+	explicit JsonEntriesLocalState(Allocator &allocator) : json_allocator(std::make_shared<JSONAllocator>(allocator)) {
+	}
+
+	shared_ptr<JSONAllocator> json_allocator;
+};
+
+static unique_ptr<FunctionLocalState> JsonEntriesInitLocalState(ExpressionState &state, const BoundFunctionExpression &,
+                                                                FunctionData *) {
+	auto &context = state.GetContext();
+	return make_uniq<JsonEntriesLocalState>(BufferAllocator::Get(context));
 }
 
 struct JsonGroupMergeState {
@@ -465,6 +481,7 @@ static void AddJsonGroupMergeAggregate(AggregateFunctionSet &set, const LogicalT
 using duckdb_yyjson::yyjson_arr_iter;
 using duckdb_yyjson::yyjson_arr_iter_next;
 using duckdb_yyjson::yyjson_arr_iter_with;
+using duckdb_yyjson::yyjson_arr_size;
 using duckdb_yyjson::yyjson_doc;
 using duckdb_yyjson::yyjson_doc_free;
 using duckdb_yyjson::yyjson_doc_get_root;
@@ -489,6 +506,7 @@ using duckdb_yyjson::yyjson_obj_iter;
 using duckdb_yyjson::yyjson_obj_iter_get_val;
 using duckdb_yyjson::yyjson_obj_iter_next;
 using duckdb_yyjson::yyjson_obj_iter_with;
+using duckdb_yyjson::yyjson_obj_size;
 using duckdb_yyjson::yyjson_read_opts;
 using duckdb_yyjson::yyjson_val;
 using duckdb_yyjson::yyjson_val_mut_copy;
@@ -722,6 +740,137 @@ inline void JsonAddPrefixScalarFun(DataChunk &args, ExpressionState &state, Vect
 	    });
 }
 
+inline LogicalType GetJsonEntriesReturnType() {
+	child_list_t<LogicalType> children;
+	children.emplace_back("key", LogicalType::VARCHAR);
+	children.emplace_back("value", LogicalType::JSON());
+	auto struct_type = LogicalType::STRUCT(std::move(children));
+	return LogicalType::LIST(std::move(struct_type));
+}
+
+// Helper: Check if string needs JSON escaping
+static inline bool NeedsJsonEscaping(const char *str, size_t len) {
+	for (size_t i = 0; i < len; i++) {
+		char c = str[i];
+		// Check for characters that need escaping in JSON: ", \, and control chars
+		if (c == '"' || c == '\\' || c < 32) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Helper: Serialize JSON value
+static inline void SerializeJsonValue(yyjson_val *value, Vector &value_vector, idx_t write_index, string_t *value_data,
+                                      ValidityMask &value_validity, duckdb_yyjson::yyjson_alc *alc) {
+	if (duckdb_yyjson::yyjson_is_null(value)) {
+		value_validity.SetInvalid(write_index);
+		value_data[write_index] = string_t {};
+	} else {
+		idx_t json_len = 0;
+		auto json_cstr = JSONCommon::WriteVal(value, alc, json_len);
+		if (!json_cstr) {
+			throw InternalException("json_entries: failed to serialize JSON value");
+		}
+		value_data[write_index] = StringVector::AddString(value_vector, json_cstr, json_len);
+	}
+}
+
+inline void JsonEntriesScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto state_ptr = ExecuteFunctionState::GetFunctionState(state);
+	D_ASSERT(state_ptr);
+	auto &local_state = state_ptr->Cast<JsonEntriesLocalState>();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+
+	auto count = args.size();
+	auto &input = args.data[0];
+	UnifiedVectorFormat input_data;
+	input.ToUnifiedFormat(count, input_data);
+
+	auto list_entries = FlatVector::GetData<list_entry_t>(result);
+	auto &list_child = ListVector::GetEntry(result);
+	auto &struct_children = StructVector::GetEntries(list_child);
+	D_ASSERT(struct_children.size() == 2);
+	auto &key_vector = *struct_children[0];
+	auto &value_vector = *struct_children[1];
+
+	idx_t list_size = ListVector::GetListSize(result);
+
+	for (idx_t i = 0; i < count; i++) {
+		auto input_index = input_data.sel->get_index(i);
+		if (!input_data.validity.RowIsValid(input_index)) {
+			list_entries[i] = {list_size, 0};
+			continue;
+		}
+
+		auto json_input = reinterpret_cast<string_t *>(input_data.data)[input_index];
+		auto &allocator = *local_state.json_allocator;
+		allocator.Reset();
+		auto alc = allocator.GetYYAlc();
+		duckdb_yyjson::yyjson_read_err err;
+		auto doc = yyjson_read_opts(const_cast<char *>(json_input.GetDataUnsafe()), json_input.GetSize(),
+		                            duckdb_yyjson::YYJSON_READ_NOFLAG, alc, &err);
+		if (!doc) {
+			throw InvalidInputException(StringUtil::Format("json_entries: invalid JSON at position %llu: %s",
+			                                               static_cast<unsigned long long>(err.pos),
+			                                               err.msg ? err.msg : "unknown error"));
+		}
+		std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc_handle(doc, yyjson_doc_free);
+		auto root = yyjson_doc_get_root(doc);
+		if (!root) {
+			throw InvalidInputException("json_entries: invalid JSON payload");
+		}
+
+		bool is_object = yyjson_is_obj(root);
+		bool is_array = yyjson_is_arr(root);
+		if (!is_object && !is_array) {
+			throw InvalidInputException("json_entries: expected JSON object or array input");
+		}
+
+		auto element_count = is_object ? yyjson_obj_size(root) : yyjson_arr_size(root);
+		list_entries[i] = {list_size, element_count};
+		if (element_count == 0) {
+			continue;
+		}
+		ListVector::Reserve(result, list_size + element_count);
+		ListVector::SetListSize(result, list_size + element_count);
+		auto key_data = FlatVector::GetData<string_t>(key_vector);
+		auto value_data = FlatVector::GetData<string_t>(value_vector);
+		auto &value_validity = FlatVector::Validity(value_vector);
+
+		idx_t write_index = list_size;
+		if (is_object) {
+			yyjson_val *key;
+			yyjson_obj_iter iter = yyjson_obj_iter_with(root);
+			while ((key = yyjson_obj_iter_next(&iter))) {
+				auto value = yyjson_obj_iter_get_val(key);
+				auto key_str = duckdb_yyjson::yyjson_get_str(key);
+				auto key_len = duckdb_yyjson::yyjson_get_len(key);
+				key_data[write_index] = StringVector::AddString(key_vector, key_str, key_len);
+				// Use optimized serialization with type-specific fast paths
+				SerializeJsonValue(value, value_vector, write_index, value_data, value_validity, alc);
+				write_index++;
+			}
+		} else {
+			yyjson_val *element;
+			yyjson_arr_iter iter = yyjson_arr_iter_with(root);
+			idx_t index = 0;
+			while ((element = yyjson_arr_iter_next(&iter))) {
+				auto index_str = std::to_string(index);
+				key_data[write_index] = StringVector::AddString(key_vector, index_str);
+				// Use optimized serialization with type-specific fast paths
+				SerializeJsonValue(element, value_vector, write_index, value_data, value_validity, alc);
+				write_index++;
+				index++;
+			}
+		}
+
+		list_size += element_count;
+	}
+
+	ListVector::SetListSize(result, list_size);
+}
+
 static void LoadInternal(JsonToolsLoadContext &ctx) {
 	auto json_flatten_scalar_function =
 	    ScalarFunction("json_flatten", {LogicalType::JSON()}, LogicalType::JSON(), JsonFlattenScalarFun, nullptr,
@@ -732,6 +881,11 @@ static void LoadInternal(JsonToolsLoadContext &ctx) {
 	    ScalarFunction("json_add_prefix", {LogicalType::JSON(), LogicalType::VARCHAR}, LogicalType::JSON(),
 	                   JsonAddPrefixScalarFun, nullptr, nullptr, nullptr, JsonAddPrefixInitLocalState);
 	RegisterScalarFunction(ctx, json_add_prefix_scalar_function);
+
+	auto json_entries_scalar_function =
+	    ScalarFunction("json_entries", {LogicalType::JSON()}, GetJsonEntriesReturnType(), JsonEntriesScalarFun, nullptr,
+	                   nullptr, nullptr, JsonEntriesInitLocalState);
+	RegisterScalarFunction(ctx, json_entries_scalar_function);
 
 	AggregateFunctionSet json_group_merge_set("json_group_merge");
 	AddJsonGroupMergeAggregate(json_group_merge_set, LogicalType::JSON());

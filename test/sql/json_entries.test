@@ -1,0 +1,71 @@
+# name: test/sql/json_entries.test
+# description: json_entries returns list<struct<key,value>> for top-level keys and array indexes
+# group: [sql]
+
+require json_tools
+
+# Ensure helper constructors from the json extension are available
+require json
+
+# ========================================
+# Object Inputs
+# ========================================
+
+query I
+SELECT kv.unnest::VARCHAR
+FROM unnest(json_entries('{"a": 1, "b": null, "c": {"d": 2}}')) AS kv(unnest)
+ORDER BY kv.unnest.key;
+----
+{'key': a, 'value': 1}
+{'key': b, 'value': NULL}
+{'key': c, 'value': '{"d":2}'}
+
+query I
+SELECT kv.unnest::VARCHAR
+FROM unnest(json_entries('{"x": "text", "y": [1, 2]}')) AS kv(unnest)
+ORDER BY kv.unnest.key;
+----
+{'key': x, 'value': '"text"'}
+{'key': y, 'value': '[1,2]'}
+
+query I
+SELECT COUNT(*) AS cnt FROM unnest(json_entries('{}'));
+----
+0
+
+# ========================================
+# Array Inputs
+# ========================================
+
+query I
+SELECT kv.unnest::VARCHAR
+FROM unnest(json_entries('[1, {"x": 2}, null]')) AS kv(unnest)
+ORDER BY kv.unnest.key;
+----
+{'key': 0, 'value': 1}
+{'key': 1, 'value': '{"x":2}'}
+{'key': 2, 'value': NULL}
+
+query I
+SELECT COUNT(*) AS cnt FROM unnest(json_entries('[]'));
+----
+0
+
+# ========================================
+# Null and Error Handling
+# ========================================
+
+query I
+SELECT COUNT(*) AS cnt FROM unnest(json_entries(NULL));
+----
+0
+
+statement error
+SELECT json_entries('1'::JSON);
+----
+Invalid Input Error: json_entries: expected JSON object or array input
+
+statement error
+SELECT json_entries('null'::JSON);
+----
+Invalid Input Error: json_entries: expected JSON object or array input

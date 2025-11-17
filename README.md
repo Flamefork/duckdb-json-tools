@@ -13,6 +13,7 @@ This extension provides a set of utility functions to work with JSON data, focus
 
 - **`json_flatten(json)`**: Recursively flattens nested JSON objects and arrays into a single-level object with dot-separated keys.
 - **`json_add_prefix(json, text)`**: Adds a string prefix to every top-level key in a JSON object.
+- **`json_entries(json)`**: Returns `LIST<STRUCT<key VARCHAR, value JSON>>` for top-level object members or array indexes.
 - **`json_group_merge(json [ORDER BY ...])`**: Streams JSON patches with RFC 7396 merge semantics without materializing intermediate lists.
 
 ## Quick Start
@@ -112,6 +113,35 @@ SELECT json_add_prefix('{"user": {"name": "Alice"}, "count": 5}', 'data_');
 ```
 
 **Note:** This function requires the input to be a JSON object. It will raise an error if given a JSON array or primitive value.
+
+### `json_entries(json) -> list<struct<key varchar, value json>>`
+
+Emits a list of the top-level members of a JSON object or array. SQL `NULL` inputs produce empty lists, and JSON `null` values surface as `NULL` in the output struct.
+
+**Example (object):**
+```sql
+SELECT kv.unnest.key AS key, kv.unnest.value::VARCHAR AS value
+FROM unnest(json_entries('{"a": 1, "b": null, "c": {"d": 2}}')) AS kv(unnest);
+```
+*Result:*
+```
+key|value
+a  |1
+b  |NULL
+c  |{"d":2}
+```
+
+**Example (array):**
+```sql
+SELECT kv.unnest.key AS key, kv.unnest.value::VARCHAR AS value
+FROM unnest(json_entries('[1, {"x": 2}]')) AS kv(unnest);
+```
+*Result:*
+```
+key|value
+0  |1
+1  |{"x":2}
+```
 
 ### `json_group_merge(json_expr [, treat_null_values] [ORDER BY ...]) -> json`
 
