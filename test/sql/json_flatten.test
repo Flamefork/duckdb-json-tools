@@ -47,6 +47,35 @@ SELECT json_flatten('{');
 Conversion Error: Malformed JSON at byte 1 of input: unexpected end of data.  Input: "{"
 
 # ========================================
+# Parser Flag Alignment Tests
+# ========================================
+
+query I
+SELECT json_flatten('{"a":1,}');
+----
+{"a":1}
+
+query I
+SELECT lower(json_flatten('{"a":NaN}')::VARCHAR) LIKE '%nan%' AS ok;
+----
+true
+
+query I
+SELECT lower(json_flatten('{"a":Infinity}')::VARCHAR) LIKE '%inf%' AS ok;
+----
+true
+
+query I
+SELECT json_flatten('{"a":18446744073709551616}')::VARCHAR LIKE '%18446744073709551616%' AS ok;
+----
+true
+
+query I
+SELECT lower(json_flatten('{"a":18446744073709551616}')::VARCHAR) NOT LIKE '%e%' AS ok;
+----
+true
+
+# ========================================
 # Unicode Support Tests
 # ========================================
 

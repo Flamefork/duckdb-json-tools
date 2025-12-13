@@ -631,11 +631,9 @@ inline string_t JsonFlattenSingle(Vector &result, const string_t &input, JsonFla
 	auto input_length = input.GetSize();
 	duckdb_yyjson::yyjson_read_err err;
 	auto doc =
-	    yyjson_read_opts(const_cast<char *>(input_data), input_length, duckdb_yyjson::YYJSON_READ_NOFLAG, alc, &err);
+	    yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err);
 	if (!doc) {
-		throw InvalidInputException(StringUtil::Format("json_flatten: invalid JSON at position %llu: %s",
-		                                               static_cast<unsigned long long>(err.pos),
-		                                               err.msg ? err.msg : "unknown error"));
+		throw InvalidInputException("json_flatten: %s", JSONCommon::FormatParseError(input_data, input_length, err));
 	}
 	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc_handle(doc, yyjson_doc_free);
 	auto root = yyjson_doc_get_root(doc);
@@ -658,7 +656,7 @@ inline string_t JsonFlattenSingle(Vector &result, const string_t &input, JsonFla
 	FlattenIntoObject(root, out_doc, out_root, key_buffer, separator, 0);
 	size_t output_length = 0;
 	auto output_cstr =
-	    yyjson_mut_write_opts(out_doc, duckdb_yyjson::YYJSON_WRITE_NOFLAG, nullptr, &output_length, nullptr);
+	    yyjson_mut_write_opts(out_doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
 	if (!output_cstr) {
 		throw InternalException("json_flatten: failed to serialize flattened JSON");
 	}
@@ -675,11 +673,9 @@ inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const
 	auto input_length = input.GetSize();
 	duckdb_yyjson::yyjson_read_err err;
 	auto doc =
-	    yyjson_read_opts(const_cast<char *>(input_data), input_length, duckdb_yyjson::YYJSON_READ_NOFLAG, alc, &err);
+	    yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err);
 	if (!doc) {
-		throw InvalidInputException(StringUtil::Format("json_add_prefix: invalid JSON at position %llu: %s",
-		                                               static_cast<unsigned long long>(err.pos),
-		                                               err.msg ? err.msg : "unknown error"));
+		throw InvalidInputException("json_add_prefix: %s", JSONCommon::FormatParseError(input_data, input_length, err));
 	}
 
 	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc_handle(doc, yyjson_doc_free);
@@ -745,7 +741,7 @@ inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const
 
 	size_t output_length = 0;
 	auto output_cstr =
-	    yyjson_mut_write_opts(out_doc, duckdb_yyjson::YYJSON_WRITE_NOFLAG, nullptr, &output_length, nullptr);
+	    yyjson_mut_write_opts(out_doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
 	if (!output_cstr) {
 		throw InternalException("json_add_prefix: failed to serialize output JSON");
 	}
