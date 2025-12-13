@@ -71,6 +71,62 @@ static unique_ptr<FunctionLocalState> JsonFlattenInitLocalState(ExpressionState 
 	return make_uniq<JsonFlattenLocalState>(BufferAllocator::Get(context));
 }
 
+struct JsonFlattenBindData : public FunctionData {
+	explicit JsonFlattenBindData(string separator_p) : separator(std::move(separator_p)) {
+	}
+
+	string separator;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<JsonFlattenBindData>(separator);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		const auto &other = other_p.Cast<JsonFlattenBindData>();
+		return separator == other.separator;
+	}
+};
+
+static const string &GetJsonFlattenSeparator(optional_ptr<FunctionData> bind_data) {
+	static const string DEFAULT_SEPARATOR = ".";
+	if (!bind_data) {
+		return DEFAULT_SEPARATOR;
+	}
+	return bind_data->Cast<JsonFlattenBindData>().separator;
+}
+
+static idx_t UTF8CharacterCount(const string &input) {
+	idx_t count = 0;
+	for (auto c : input) {
+		count += (static_cast<uint8_t>(c) & 0xc0) != 0x80;
+	}
+	return count;
+}
+
+static unique_ptr<FunctionData> JsonFlattenBind(ClientContext &context, ScalarFunction &function,
+                                                vector<unique_ptr<Expression>> &arguments) {
+	if (arguments.size() != 2) {
+		throw BinderException("json_flatten expects a JSON argument plus a separator parameter");
+	}
+	auto &separator_arg = arguments[1];
+	if (separator_arg->return_type.id() == LogicalTypeId::UNKNOWN || separator_arg->HasParameter()) {
+		throw ParameterNotResolvedException();
+	}
+	if (!separator_arg->IsFoldable()) {
+		throw BinderException("json_flatten separator argument must be constant");
+	}
+	auto separator_value = ExpressionExecutor::EvaluateScalar(context, *separator_arg);
+	if (separator_value.IsNull() || separator_value.type().id() != LogicalTypeId::VARCHAR) {
+		throw BinderException("json_flatten separator must be a VARCHAR literal of length 1");
+	}
+	auto separator = separator_value.ToString();
+	if (UTF8CharacterCount(separator) != 1) {
+		throw BinderException("json_flatten separator must be a VARCHAR literal of length 1");
+	}
+	Function::EraseArgument(function, arguments, 1);
+	return make_uniq<JsonFlattenBindData>(std::move(separator));
+}
+
 struct JsonAddPrefixLocalState : public FunctionLocalState {
 	explicit JsonAddPrefixLocalState(Allocator &allocator)
 	    : json_allocator(std::make_shared<JSONAllocator>(allocator)) {
@@ -512,9 +568,9 @@ static void AppendIndexToKeyBuffer(std::string &key_buffer, idx_t index) {
 	}
 }
 
-// Depth-first traversal that materializes dotted key paths for leaf values.
+// Depth-first traversal that materializes key paths for leaf values.
 static void FlattenIntoObject(yyjson_val *node, yyjson_mut_doc *out_doc, yyjson_mut_val *out_obj,
-                              std::string &key_buffer, idx_t depth = 0) {
+                              std::string &key_buffer, const string &separator, idx_t depth = 0) {
 	if (depth > MAX_JSON_NESTING_DEPTH) {
 		throw InvalidInputException("json_flatten: nesting depth exceeds maximum limit of " +
 		                            std::to_string(MAX_JSON_NESTING_DEPTH));
@@ -526,12 +582,12 @@ static void FlattenIntoObject(yyjson_val *node, yyjson_mut_doc *out_doc, yyjson_
 			auto child = yyjson_obj_iter_get_val(key);
 			auto previous_size = key_buffer.size();
 			if (previous_size != 0) {
-				key_buffer.push_back('.');
+				key_buffer.append(separator);
 			}
 			auto key_str = duckdb_yyjson::yyjson_get_str(key);
 			auto key_len = duckdb_yyjson::yyjson_get_len(key);
 			key_buffer.append(key_str, key_len);
-			FlattenIntoObject(child, out_doc, out_obj, key_buffer, depth + 1);
+			FlattenIntoObject(child, out_doc, out_obj, key_buffer, separator, depth + 1);
 			key_buffer.resize(previous_size);
 		}
 	} else if (yyjson_is_arr(node)) {
@@ -541,10 +597,10 @@ static void FlattenIntoObject(yyjson_val *node, yyjson_mut_doc *out_doc, yyjson_
 		while ((child = yyjson_arr_iter_next(&iter))) {
 			auto previous_size = key_buffer.size();
 			if (previous_size != 0) {
-				key_buffer.push_back('.');
+				key_buffer.append(separator);
 			}
 			AppendIndexToKeyBuffer(key_buffer, index);
-			FlattenIntoObject(child, out_doc, out_obj, key_buffer, depth + 1);
+			FlattenIntoObject(child, out_doc, out_obj, key_buffer, separator, depth + 1);
 			key_buffer.resize(previous_size);
 			index++;
 		}
@@ -566,7 +622,8 @@ static void FlattenIntoObject(yyjson_val *node, yyjson_mut_doc *out_doc, yyjson_
 }
 
 // Parse the input JSON, flatten into a new document, and return the serialized payload.
-inline string_t JsonFlattenSingle(Vector &result, const string_t &input, JsonFlattenLocalState &local_state) {
+inline string_t JsonFlattenSingle(Vector &result, const string_t &input, JsonFlattenLocalState &local_state,
+                                  const string &separator) {
 	auto &allocator = *local_state.json_allocator;
 	allocator.Reset();
 	auto alc = allocator.GetYYAlc();
@@ -598,7 +655,7 @@ inline string_t JsonFlattenSingle(Vector &result, const string_t &input, JsonFla
 	auto &key_buffer = local_state.key_buffer;
 	key_buffer.clear();
 	key_buffer.reserve(static_cast<size_t>(std::min<idx_t>(input_length, DEFAULT_KEY_BUFFER_SIZE)));
-	FlattenIntoObject(root, out_doc, out_root, key_buffer, 0);
+	FlattenIntoObject(root, out_doc, out_root, key_buffer, separator, 0);
 	size_t output_length = 0;
 	auto output_cstr =
 	    yyjson_mut_write_opts(out_doc, duckdb_yyjson::YYJSON_WRITE_NOFLAG, nullptr, &output_length, nullptr);
@@ -703,9 +760,11 @@ inline void JsonFlattenScalarFun(DataChunk &args, ExpressionState &state, Vector
 	auto state_ptr = ExecuteFunctionState::GetFunctionState(state);
 	D_ASSERT(state_ptr);
 	auto &local_state = state_ptr->Cast<JsonFlattenLocalState>();
+	auto bind_data = state.expr.Cast<BoundFunctionExpression>().bind_info.get();
+	auto &separator = GetJsonFlattenSeparator(bind_data);
 	auto &input = args.data[0];
 	UnaryExecutor::Execute<string_t, string_t>(input, result, args.size(), [&](const string_t &json_input) {
-		return JsonFlattenSingle(result, json_input, local_state);
+		return JsonFlattenSingle(result, json_input, local_state, separator);
 	});
 }
 
@@ -727,6 +786,11 @@ static void LoadInternal(JsonToolsLoadContext &ctx) {
 	    ScalarFunction("json_flatten", {LogicalType::JSON()}, LogicalType::JSON(), JsonFlattenScalarFun, nullptr,
 	                   nullptr, nullptr, JsonFlattenInitLocalState);
 	RegisterScalarFunction(ctx, json_flatten_scalar_function);
+
+	auto json_flatten_separator_scalar_function =
+	    ScalarFunction("json_flatten", {LogicalType::JSON(), LogicalType::VARCHAR}, LogicalType::JSON(),
+	                   JsonFlattenScalarFun, JsonFlattenBind, nullptr, nullptr, JsonFlattenInitLocalState);
+	RegisterScalarFunction(ctx, json_flatten_separator_scalar_function);
 
 	auto json_add_prefix_scalar_function =
 	    ScalarFunction("json_add_prefix", {LogicalType::JSON(), LogicalType::VARCHAR}, LogicalType::JSON(),
