@@ -141,11 +141,14 @@ static unique_ptr<FunctionLocalState> JsonAddPrefixInitLocalState(ExpressionStat
 	return make_uniq<JsonAddPrefixLocalState>(BufferAllocator::Get(context));
 }
 
-struct JsonGroupMergeState {
-	yyjson_mut_doc *doc;
-	bool has_input;
-	idx_t replacements_since_compact;
-};
+	struct JsonGroupMergeState {
+		yyjson_mut_doc *result_doc;
+		yyjson_mut_doc *patch_doc;
+		bool result_has_input;
+		bool patch_has_input;
+		idx_t result_replacements_since_compact;
+		idx_t patch_replacements_since_compact;
+	};
 
 enum class JsonNullTreatment : uint8_t { DELETE_NULLS = 0, IGNORE_NULLS = 1 };
 
@@ -175,87 +178,136 @@ static JsonNullTreatment GetNullTreatment(optional_ptr<FunctionData> bind_data) 
 static unique_ptr<FunctionData> JsonGroupMergeBind(ClientContext &context, AggregateFunction &function,
                                                    vector<unique_ptr<Expression>> &arguments);
 
-static void JsonGroupMergeStateInit(JsonGroupMergeState &state) {
-	state.doc = yyjson_mut_doc_new(nullptr);
-	if (!state.doc) {
-		throw InternalException("json_group_merge: failed to allocate aggregate state");
+	static void JsonGroupMergeStateInit(JsonGroupMergeState &state) {
+		state.result_doc = yyjson_mut_doc_new(nullptr);
+		if (!state.result_doc) {
+			throw InternalException("json_group_merge: failed to allocate aggregate state");
+		}
+		state.patch_doc = yyjson_mut_doc_new(nullptr);
+		if (!state.patch_doc) {
+			yyjson_mut_doc_free(state.result_doc);
+			state.result_doc = nullptr;
+			throw InternalException("json_group_merge: failed to allocate aggregate state");
+		}
+		auto result_root = yyjson_mut_obj(state.result_doc);
+		if (!result_root) {
+			yyjson_mut_doc_free(state.patch_doc);
+			yyjson_mut_doc_free(state.result_doc);
+			state.patch_doc = nullptr;
+			state.result_doc = nullptr;
+			throw InternalException("json_group_merge: failed to allocate initial JSON object");
+		}
+		auto patch_root = yyjson_mut_obj(state.patch_doc);
+		if (!patch_root) {
+			yyjson_mut_doc_free(state.patch_doc);
+			yyjson_mut_doc_free(state.result_doc);
+			state.patch_doc = nullptr;
+			state.result_doc = nullptr;
+			throw InternalException("json_group_merge: failed to allocate initial JSON object");
+		}
+		yyjson_mut_doc_set_root(state.result_doc, result_root);
+		yyjson_mut_doc_set_root(state.patch_doc, patch_root);
+		state.result_has_input = false;
+		state.patch_has_input = false;
+		state.result_replacements_since_compact = 0;
+		state.patch_replacements_since_compact = 0;
 	}
-	auto root = yyjson_mut_obj(state.doc);
-	if (!root) {
-		yyjson_mut_doc_free(state.doc);
-		state.doc = nullptr;
-		throw InternalException("json_group_merge: failed to allocate initial JSON object");
-	}
-	yyjson_mut_doc_set_root(state.doc, root);
-	state.has_input = false;
-	state.replacements_since_compact = 0;
-}
 
-static void JsonGroupMergeStateDestroy(JsonGroupMergeState &state) {
-	if (state.doc) {
-		yyjson_mut_doc_free(state.doc);
-		state.doc = nullptr;
+	static void JsonGroupMergeStateDestroy(JsonGroupMergeState &state) {
+		if (state.result_doc) {
+			yyjson_mut_doc_free(state.result_doc);
+			state.result_doc = nullptr;
+		}
+		if (state.patch_doc) {
+			yyjson_mut_doc_free(state.patch_doc);
+			state.patch_doc = nullptr;
+		}
+		state.result_has_input = false;
+		state.patch_has_input = false;
+		state.result_replacements_since_compact = 0;
+		state.patch_replacements_since_compact = 0;
 	}
-	state.has_input = false;
-	state.replacements_since_compact = 0;
-}
 
 constexpr idx_t JSON_GROUP_MERGE_COMPACT_THRESHOLD = 1024;
 // Maximum nesting depth to prevent stack exhaustion from pathological inputs
 constexpr idx_t MAX_JSON_NESTING_DEPTH = 1000;
 
-static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
-                                                        idx_t depth, idx_t &replacements_since_compact,
-                                                        JsonNullTreatment null_treatment);
+	static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
+	                                                        idx_t depth, idx_t &replacements_since_compact,
+	                                                        JsonNullTreatment null_treatment);
 
-static void JsonGroupMergeCompactState(JsonGroupMergeState &state) {
-	if (!state.doc || !state.doc->root) {
-		state.replacements_since_compact = 0;
-		return;
+	static void JsonGroupMergeCompactDoc(yyjson_mut_doc *&doc) {
+		if (!doc || !doc->root) {
+			return;
+		}
+		auto new_doc = yyjson_mut_doc_new(nullptr);
+		if (!new_doc) {
+			throw InternalException("json_group_merge: failed to compact aggregate state");
+		}
+		auto root_copy = yyjson_mut_val_mut_copy(new_doc, doc->root);
+		if (!root_copy) {
+			yyjson_mut_doc_free(new_doc);
+			throw InternalException("json_group_merge: failed to copy aggregate state during compaction");
+		}
+		yyjson_mut_doc_set_root(new_doc, root_copy);
+		yyjson_mut_doc_free(doc);
+		doc = new_doc;
 	}
-	auto new_doc = yyjson_mut_doc_new(nullptr);
-	if (!new_doc) {
-		throw InternalException("json_group_merge: failed to compact aggregate state");
-	}
-	auto root_copy = yyjson_mut_val_mut_copy(new_doc, state.doc->root);
-	if (!root_copy) {
-		yyjson_mut_doc_free(new_doc);
-		throw InternalException("json_group_merge: failed to copy aggregate state during compaction");
-	}
-	yyjson_mut_doc_set_root(new_doc, root_copy);
-	yyjson_mut_doc_free(state.doc);
-	state.doc = new_doc;
-	state.replacements_since_compact = 0;
-}
 
-static void JsonGroupMergeMaybeCompact(JsonGroupMergeState &state) {
-	if (state.replacements_since_compact < JSON_GROUP_MERGE_COMPACT_THRESHOLD) {
-		return;
+	static void JsonGroupMergeMaybeCompact(JsonGroupMergeState &state) {
+		if (state.result_replacements_since_compact >= JSON_GROUP_MERGE_COMPACT_THRESHOLD) {
+			JsonGroupMergeCompactDoc(state.result_doc);
+			state.result_replacements_since_compact = 0;
+		}
+		if (state.patch_replacements_since_compact >= JSON_GROUP_MERGE_COMPACT_THRESHOLD) {
+			JsonGroupMergeCompactDoc(state.patch_doc);
+			state.patch_replacements_since_compact = 0;
+		}
 	}
-	JsonGroupMergeCompactState(state);
-}
 
-static void JsonGroupMergeApplyPatch(JsonGroupMergeState &state, yyjson_val *patch_root,
-                                     JsonNullTreatment null_treatment) {
-	if (!patch_root) {
-		throw InvalidInputException("json_group_merge: invalid JSON payload");
+	static void JsonGroupMergeApplyResultPatch(JsonGroupMergeState &state, yyjson_val *patch_root,
+	                                     JsonNullTreatment null_treatment) {
+		if (!patch_root) {
+			throw InvalidInputException("json_group_merge: invalid JSON payload");
+		}
+		auto base_root = state.result_has_input ? state.result_doc->root : nullptr;
+		auto merged_root = JsonGroupMergeApplyPatchInternal(state.result_doc, base_root, patch_root, 0,
+		                                                    state.result_replacements_since_compact, null_treatment);
+		if (!merged_root) {
+			throw InternalException("json_group_merge: failed to merge JSON documents");
+		}
+		if (!state.result_has_input || merged_root != state.result_doc->root) {
+			yyjson_mut_doc_set_root(state.result_doc, merged_root);
+		}
+		state.result_has_input = true;
+		JsonGroupMergeMaybeCompact(state);
 	}
-	auto base_root = state.has_input ? state.doc->root : nullptr;
-	auto merged_root = JsonGroupMergeApplyPatchInternal(state.doc, base_root, patch_root, 0,
-	                                                    state.replacements_since_compact, null_treatment);
-	if (!merged_root) {
-		throw InternalException("json_group_merge: failed to merge JSON documents");
-	}
-	if (!state.has_input || merged_root != state.doc->root) {
-		yyjson_mut_doc_set_root(state.doc, merged_root);
-	}
-	state.has_input = true;
-	JsonGroupMergeMaybeCompact(state);
-}
 
-static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
-                                                        idx_t depth, idx_t &replacements_since_compact,
-                                                        JsonNullTreatment null_treatment) {
+	static yyjson_mut_val *JsonGroupMergeComposePatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
+	                                                         idx_t depth, idx_t &replacements_since_compact,
+	                                                         JsonNullTreatment null_treatment);
+
+	static void JsonGroupMergeComposePatch(JsonGroupMergeState &state, yyjson_val *patch_root,
+	                                      JsonNullTreatment null_treatment) {
+		if (!patch_root) {
+			throw InvalidInputException("json_group_merge: invalid JSON payload");
+		}
+		auto base_root = state.patch_has_input ? state.patch_doc->root : nullptr;
+		auto merged_root = JsonGroupMergeComposePatchInternal(state.patch_doc, base_root, patch_root, 0,
+		                                                      state.patch_replacements_since_compact, null_treatment);
+		if (!merged_root) {
+			throw InternalException("json_group_merge: failed to merge JSON documents");
+		}
+		if (!state.patch_has_input || merged_root != state.patch_doc->root) {
+			yyjson_mut_doc_set_root(state.patch_doc, merged_root);
+		}
+		state.patch_has_input = true;
+		JsonGroupMergeMaybeCompact(state);
+	}
+
+	static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
+	                                                        idx_t depth, idx_t &replacements_since_compact,
+	                                                        JsonNullTreatment null_treatment) {
 	if (!patch) {
 		return base;
 	}
@@ -376,12 +428,144 @@ static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyj
 		return base;
 	}
 
-	// Something was applied, ensure we have a result object to return
-	return result ? result : EnsureResult();
-}
+		// Something was applied, ensure we have a result object to return
+		return result ? result : EnsureResult();
+	}
 
-class JsonGroupMergeFunction {
-public:
+	static yyjson_mut_val *JsonGroupMergeComposePatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
+	                                                         idx_t depth, idx_t &replacements_since_compact,
+	                                                         JsonNullTreatment null_treatment) {
+		if (!patch) {
+			return base;
+		}
+		if (depth > MAX_JSON_NESTING_DEPTH) {
+			throw InvalidInputException("json_group_merge: nesting depth exceeds maximum limit of " +
+			                            std::to_string(MAX_JSON_NESTING_DEPTH));
+		}
+		if (!duckdb_yyjson::yyjson_is_obj(patch)) {
+			auto copy = yyjson_val_mut_copy(doc, patch);
+			if (!copy) {
+				throw InternalException("json_group_merge: failed to materialize JSON value");
+			}
+			if (base) {
+				replacements_since_compact++;
+			}
+			return copy;
+		}
+
+		yyjson_mut_val *result = nullptr;
+		bool base_is_object = base && duckdb_yyjson::yyjson_mut_is_obj(base);
+		if (base_is_object) {
+			result = base;
+		}
+
+		auto EnsureResult = [&]() -> yyjson_mut_val * {
+			if (result) {
+				return result;
+			}
+			result = yyjson_mut_obj(doc);
+			if (!result) {
+				throw InternalException("json_group_merge: failed to allocate JSON object");
+			}
+			if (base && !base_is_object) {
+				replacements_since_compact++;
+			}
+			return result;
+		};
+
+		bool applied_any = false;
+
+		yyjson_val *patch_key = nullptr;
+		yyjson_obj_iter patch_iter = yyjson_obj_iter_with(patch);
+		while ((patch_key = yyjson_obj_iter_next(&patch_iter))) {
+			auto key_str = duckdb_yyjson::yyjson_get_str(patch_key);
+			auto key_len = duckdb_yyjson::yyjson_get_len(patch_key);
+			auto patch_val = yyjson_obj_iter_get_val(patch_key);
+
+			if (!key_str) {
+				throw InvalidInputException("json_group_merge: encountered non-string object key");
+			}
+
+			if (duckdb_yyjson::yyjson_is_null(patch_val)) {
+				if (null_treatment == JsonNullTreatment::IGNORE_NULLS) {
+					continue;
+				}
+				auto target_obj = EnsureResult();
+				auto removed = duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
+				if (removed) {
+					replacements_since_compact++;
+				}
+				auto key_copy = yyjson_mut_strncpy(doc, key_str, key_len);
+				if (!key_copy) {
+					throw InternalException("json_group_merge: failed to allocate key storage");
+				}
+				auto null_value = yyjson_mut_null(doc);
+				if (!null_value) {
+					throw InternalException("json_group_merge: failed to allocate JSON null value");
+				}
+				if (!duckdb_yyjson::yyjson_mut_obj_add(target_obj, key_copy, null_value)) {
+					throw InternalException("json_group_merge: failed to append merged value");
+				}
+				applied_any = true;
+				continue;
+			}
+
+			auto existing_child = result ? duckdb_yyjson::yyjson_mut_obj_getn(result, key_str, key_len) : nullptr;
+			if (duckdb_yyjson::yyjson_is_obj(patch_val)) {
+				auto merged_child = JsonGroupMergeComposePatchInternal(doc, existing_child, patch_val, depth + 1,
+				                                                      replacements_since_compact, null_treatment);
+				if (!merged_child) {
+					continue;
+				}
+				if (!existing_child || merged_child != existing_child) {
+					auto target_obj = EnsureResult();
+					if (existing_child) {
+						replacements_since_compact++;
+						duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
+					}
+					auto key_copy = yyjson_mut_strncpy(doc, key_str, key_len);
+					if (!key_copy) {
+						throw InternalException("json_group_merge: failed to allocate key storage");
+					}
+					if (!duckdb_yyjson::yyjson_mut_obj_add(target_obj, key_copy, merged_child)) {
+						throw InternalException("json_group_merge: failed to append merged object value");
+					}
+					applied_any = true;
+				}
+				continue;
+			}
+
+			auto new_child = yyjson_val_mut_copy(doc, patch_val);
+			if (!new_child) {
+				throw InternalException("json_group_merge: failed to copy JSON value");
+			}
+			auto target_obj = EnsureResult();
+			if (existing_child) {
+				replacements_since_compact++;
+				duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
+			}
+			auto key_copy = yyjson_mut_strncpy(doc, key_str, key_len);
+			if (!key_copy) {
+				throw InternalException("json_group_merge: failed to allocate key storage");
+			}
+			if (!duckdb_yyjson::yyjson_mut_obj_add(target_obj, key_copy, new_child)) {
+				throw InternalException("json_group_merge: failed to append merged value");
+			}
+			applied_any = true;
+		}
+
+		if (!applied_any) {
+			if (depth == 0 && !base) {
+				return EnsureResult();
+			}
+			return base;
+		}
+
+		return result ? result : EnsureResult();
+	}
+
+ class JsonGroupMergeFunction {
+ public:
 	static void Initialize(JsonGroupMergeState &state) {
 		JsonGroupMergeStateInit(state);
 	}
@@ -410,7 +594,8 @@ public:
 			throw InvalidInputException("json_group_merge: invalid JSON payload");
 		}
 		auto null_treatment = GetNullTreatment(unary_input.input.bind_data);
-		JsonGroupMergeApplyPatch(state, patch_root, null_treatment);
+		JsonGroupMergeApplyResultPatch(state, patch_root, null_treatment);
+		JsonGroupMergeComposePatch(state, patch_root, null_treatment);
 	}
 
 	template <class INPUT_TYPE, class STATE, class OP>
@@ -423,21 +608,31 @@ public:
 
 	template <class STATE, class OP>
 	static void Combine(const STATE &source, STATE &target, AggregateInputData &aggr_input_data) {
-		if (!source.has_input || !source.doc || !source.doc->root) {
+		if (!source.patch_has_input || !source.patch_doc || !source.patch_doc->root) {
 			return;
 		}
-		JsonGroupMergeApplyPatch(target, reinterpret_cast<yyjson_val *>(source.doc->root),
-		                         GetNullTreatment(aggr_input_data.bind_data));
+		auto source_patch_doc_ptr = yyjson_doc_ptr(yyjson_mut_val_imut_copy(source.patch_doc->root, nullptr));
+		if (!source_patch_doc_ptr) {
+			throw InternalException("json_group_merge: failed to materialize patch state");
+		}
+		auto patch_root = yyjson_doc_get_root(source_patch_doc_ptr.get());
+		if (!patch_root) {
+			throw InternalException("json_group_merge: failed to materialize patch state");
+		}
+		auto null_treatment = GetNullTreatment(aggr_input_data.bind_data);
+		JsonGroupMergeApplyResultPatch(target, patch_root, null_treatment);
+		JsonGroupMergeComposePatch(target, patch_root, null_treatment);
 	}
 
 	template <class RESULT_TYPE, class STATE>
 	static void Finalize(STATE &state, RESULT_TYPE &target, AggregateFinalizeData &finalize_data) {
-		if (!state.doc || !state.doc->root) {
+		if (!state.result_doc || !state.result_doc->root) {
 			finalize_data.ReturnNull();
 			return;
 		}
 		size_t output_length = 0;
-		auto output_cstr = yyjson_mut_write_opts(state.doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
+		auto output_cstr =
+		    yyjson_mut_write_opts(state.result_doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
 		if (!output_cstr) {
 			throw InternalException("json_group_merge: failed to serialize aggregate result");
 		}
