@@ -11,7 +11,7 @@ This extension provides a set of utility functions to work with JSON data, focus
 
 ## Core Features
 
-- **`json_flatten(json)`**: Recursively flattens nested JSON objects and arrays into a single-level object with dot-separated keys.
+- **`json_flatten(json[, separator])`**: Recursively flattens nested JSON objects and arrays into a single-level object with path keys (default separator: `.`).
 - **`json_add_prefix(json, text)`**: Adds a string prefix to every top-level key in a JSON object.
 - **`json_group_merge(json [ORDER BY ...])`**: Streams JSON patches with RFC 7396 merge semantics without materializing intermediate lists.
 
@@ -58,9 +58,20 @@ con.execute("LOAD './build/release/extension/json_tools/json_tools.duckdb_extens
 
 ## Usage
 
-### `json_flatten(json) -> json`
+### `json_flatten(json[, separator]) -> json`
 
-Rewrites nested JSON structures into a flat, dotted-key object. This is particularly useful for unnesting complex JSON for easier analysis.
+Rewrites nested JSON structures into a flat object with “path” keys. By default, path segments are joined with `.`.
+
+You can pass an optional `separator` (a 1-character constant `VARCHAR`) to reduce the risk of ambiguous paths when your input keys contain `.`:
+```sql
+SELECT json_flatten('{"a.b": {"c": 1}}', '/');
+```
+*Result:*
+```json
+{"a.b/c":1}
+```
+
+No escaping is performed: if your input keys contain the chosen `separator`, the output can be ambiguous and key collisions are possible. Behavior on collisions is not specified.
 
 **Example:**
 ```sql

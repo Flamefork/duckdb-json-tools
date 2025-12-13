@@ -93,6 +93,35 @@ SELECT json_add_prefix('{invalid}', 'pr.');
 Conversion Error: Malformed JSON
 
 # ========================================
+# Parser Flag Alignment Tests
+# ========================================
+
+query I
+SELECT json_add_prefix('{"a":1,}', 'p_');
+----
+{"p_a":1}
+
+query I
+SELECT lower(json_add_prefix('{"a":NaN}', 'p_')::VARCHAR) LIKE '%nan%' AS ok;
+----
+true
+
+query I
+SELECT lower(json_add_prefix('{"a":Infinity}', 'p_')::VARCHAR) LIKE '%inf%' AS ok;
+----
+true
+
+query I
+SELECT json_add_prefix('{"a":18446744073709551616}', 'p_')::VARCHAR LIKE '%18446744073709551616%' AS ok;
+----
+true
+
+query I
+SELECT lower(json_add_prefix('{"a":18446744073709551616}', 'p_')::VARCHAR) NOT LIKE '%e%' AS ok;
+----
+true
+
+# ========================================
 # Unicode Prefix Tests
 # ========================================
 
