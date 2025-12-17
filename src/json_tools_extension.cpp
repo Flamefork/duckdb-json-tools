@@ -724,6 +724,7 @@ using duckdb_yyjson::yyjson_arr_iter_with;
 using duckdb_yyjson::yyjson_doc;
 using duckdb_yyjson::yyjson_doc_free;
 using duckdb_yyjson::yyjson_doc_get_root;
+using duckdb_yyjson::yyjson_get_tag;
 using duckdb_yyjson::yyjson_is_arr;
 using duckdb_yyjson::yyjson_is_null;
 using duckdb_yyjson::yyjson_is_obj;
@@ -749,7 +750,6 @@ using duckdb_yyjson::yyjson_obj_iter_with;
 using duckdb_yyjson::yyjson_read_opts;
 using duckdb_yyjson::yyjson_val;
 using duckdb_yyjson::yyjson_val_mut_copy;
-using duckdb_yyjson::yyjson_get_tag;
 
 struct JsonExtractColumnsBindData : public FunctionData {
 	JsonExtractColumnsBindData(vector<string> column_names_p, vector<string> patterns_p,
@@ -800,9 +800,8 @@ struct JsonExtractColumnsLocalState : public FunctionLocalState {
 	vector<bool> has_match;
 };
 
-static unique_ptr<FunctionLocalState> JsonExtractColumnsInitLocalState(ExpressionState &state,
-                                                                       const BoundFunctionExpression &expr,
-                                                                       FunctionData *bind_data) {
+static unique_ptr<FunctionLocalState>
+JsonExtractColumnsInitLocalState(ExpressionState &state, const BoundFunctionExpression &expr, FunctionData *bind_data) {
 	auto &context = state.GetContext();
 	auto column_count = bind_data->Cast<JsonExtractColumnsBindData>().column_names.size();
 	return make_uniq<JsonExtractColumnsLocalState>(BufferAllocator::Get(context), column_count);
@@ -859,8 +858,8 @@ static unique_ptr<FunctionData> JsonExtractColumnsBind(ClientContext &context, S
 	auto columns_input = StringValue::Get(columns_value);
 
 	duckdb_yyjson::yyjson_read_err err;
-	auto doc = yyjson_read_opts(const_cast<char *>(columns_input.c_str()), columns_input.size(),
-	                            JSONCommon::READ_FLAG, nullptr, &err);
+	auto doc = yyjson_read_opts(const_cast<char *>(columns_input.c_str()), columns_input.size(), JSONCommon::READ_FLAG,
+	                            nullptr, &err);
 	if (!doc) {
 		throw BinderException("json_extract_columns: %s",
 		                      JSONCommon::FormatParseError(columns_input.c_str(), columns_input.size(), err));
@@ -1244,8 +1243,7 @@ inline void JsonAddPrefixScalarFun(DataChunk &args, ExpressionState &state, Vect
 static void LoadInternal(JsonToolsLoadContext &ctx) {
 	child_list_t<LogicalType> empty_children;
 	auto json_extract_columns_function =
-	    ScalarFunction("json_extract_columns",
-	                   {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    ScalarFunction("json_extract_columns", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                   LogicalType::STRUCT(empty_children), JsonExtractColumnsFunction, JsonExtractColumnsBind, nullptr,
 	                   nullptr, JsonExtractColumnsInitLocalState);
 	json_extract_columns_function.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
