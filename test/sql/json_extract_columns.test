@@ -1,0 +1,100 @@
+# name: test/sql/json_extract_columns.test
+# description: json_extract_columns extracts regex-selected root keys into a struct of VARCHAR fields
+# group: [sql]
+
+require json_tools
+
+# Basic extraction
+query I
+SELECT (json_extract_columns('{"id": 5, "name": "duck"}', '{"id": "^id$", "name": "^name$"}', ',')).id;
+----
+5
+
+query I
+SELECT (json_extract_columns('{"id": 5, "name": "duck"}', '{"id": "^id$", "name": "^name$"}', ',')).name;
+----
+duck
+
+# Multiple matches and separators
+query I
+SELECT (json_extract_columns('{"a":1,"a2":2,"b":3}', '{"a":"^a","b":"^b$"}', '|')).a;
+----
+1|2
+
+query I
+SELECT (json_extract_columns('{"x":"a","xx":"b"}', '{"col":"x"}', '')).col;
+----
+ab
+
+query I
+SELECT (json_extract_columns('{"abc":1,"xabcx":2}', '{"v":"abc"}', ',')).v;
+----
+1,2
+
+# No matches return NULL
+query I
+SELECT (json_extract_columns('{"a":1}', '{"missing":"z"}', ',')).missing IS NULL;
+----
+true
+
+# Mixed value types stringify
+query I
+WITH res AS (
+    SELECT json_extract_columns('{"arr":[1,2],"obj":{"k":1},"flag":true,"none":null}',
+                                '{"arr":"arr","obj":"obj","flag":"flag","none":"none"}', ',') AS r)
+SELECT r.arr = '[1,2]' AND r.obj = '{"k":1}' AND r.flag = 'true' AND r.none = 'null' AS ok
+FROM res;
+----
+true
+
+# Deterministic ordering and case sensitivity controls
+query I
+WITH cte AS (
+    SELECT json_extract_columns('{"b":1,"a":2,"ab":3}', '{"v":"a"}', '|') AS r1,
+           json_extract_columns('{"b":1,"a":2,"ab":3}', '{"v":"a"}', '|') AS r2)
+SELECT r1.v = r2.v AS stable
+FROM cte;
+----
+true
+
+query I
+SELECT (json_extract_columns('{"Key": "Value"}', '{"k":"(?i)^key$"}', ',')).k;
+----
+Value
+
+query I
+SELECT (json_extract_columns('{"Key": "Value"}', '{"k":"^key$"}', ',')).k IS NULL;
+----
+true
+
+# Separator NULL errors
+statement error
+SELECT json_extract_columns('{"a":1}', '{"a":"a"}', NULL);
+----
+Invalid Input Error: json_extract_columns: separator cannot be NULL
+
+# Input shape errors
+statement error
+SELECT json_extract_columns('[1,2]', '{"a":"a"}', ',');
+----
+Invalid Input Error: json_extract_columns: expected JSON object input
+
+statement error
+SELECT json_extract_columns('{"a":1}', '["a"]', ',');
+----
+Binder Error: json_extract_columns: columns argument must be a JSON object
+
+statement error
+SELECT json_extract_columns('{"a":1}', '{"a": 1}', ',');
+----
+Binder Error: json_extract_columns: column patterns must be strings
+
+statement error
+SELECT json_extract_columns('{"a":1}', '{"a":".*", "a":"again"}', ',');
+----
+Binder Error: json_extract_columns: duplicate output column name "a"
+
+statement error
+SELECT json_extract_columns('{"a":1}', '{"a":"["}', ',');
+----
+<REGEX>:.*json_extract_columns: missing ].*
