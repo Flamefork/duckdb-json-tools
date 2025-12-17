@@ -5,11 +5,15 @@
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/function_set.hpp"
+#include "duckdb/function/scalar/regexp.hpp"
 #include "../duckdb/extension/json/include/json_common.hpp"
 #include "yyjson.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
@@ -26,6 +30,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -719,9 +724,11 @@ using duckdb_yyjson::yyjson_arr_iter_with;
 using duckdb_yyjson::yyjson_doc;
 using duckdb_yyjson::yyjson_doc_free;
 using duckdb_yyjson::yyjson_doc_get_root;
+using duckdb_yyjson::yyjson_get_tag;
 using duckdb_yyjson::yyjson_is_arr;
 using duckdb_yyjson::yyjson_is_null;
 using duckdb_yyjson::yyjson_is_obj;
+using duckdb_yyjson::yyjson_is_str;
 using duckdb_yyjson::yyjson_mut_doc;
 using duckdb_yyjson::yyjson_mut_doc_free;
 using duckdb_yyjson::yyjson_mut_doc_new;
@@ -743,6 +750,297 @@ using duckdb_yyjson::yyjson_obj_iter_with;
 using duckdb_yyjson::yyjson_read_opts;
 using duckdb_yyjson::yyjson_val;
 using duckdb_yyjson::yyjson_val_mut_copy;
+
+struct JsonExtractColumnsBindData : public FunctionData {
+	JsonExtractColumnsBindData(vector<string> column_names_p, vector<string> patterns_p,
+	                           child_list_t<LogicalType> children_p, duckdb_re2::RE2::Options options_p)
+	    : column_names(std::move(column_names_p)), patterns(std::move(patterns_p)), children(std::move(children_p)),
+	      options(std::move(options_p)) {
+		CompilePatterns();
+	}
+
+	vector<string> column_names;
+	vector<string> patterns;
+	child_list_t<LogicalType> children;
+	duckdb_re2::RE2::Options options;
+	vector<unique_ptr<duckdb_re2::RE2>> compiled_patterns;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<JsonExtractColumnsBindData>(column_names, patterns, children, options);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		const auto &other = other_p.Cast<JsonExtractColumnsBindData>();
+		return column_names == other.column_names && patterns == other.patterns &&
+		       options.case_sensitive() == other.options.case_sensitive();
+	}
+
+private:
+	void CompilePatterns() {
+		compiled_patterns.clear();
+		compiled_patterns.reserve(patterns.size());
+		for (auto &pattern : patterns) {
+			auto re = make_uniq<duckdb_re2::RE2>(pattern, options);
+			if (!re->ok()) {
+				throw BinderException("json_extract_columns: %s", re->error());
+			}
+			compiled_patterns.push_back(std::move(re));
+		}
+	}
+};
+
+struct JsonExtractColumnsLocalState : public FunctionLocalState {
+	JsonExtractColumnsLocalState(Allocator &allocator, idx_t column_count)
+	    : json_allocator(std::make_shared<JSONAllocator>(allocator)), buffers(column_count),
+	      has_match(column_count, false) {
+	}
+
+	shared_ptr<JSONAllocator> json_allocator;
+	vector<string> buffers;
+	vector<bool> has_match;
+};
+
+static unique_ptr<FunctionLocalState>
+JsonExtractColumnsInitLocalState(ExpressionState &state, const BoundFunctionExpression &expr, FunctionData *bind_data) {
+	auto &context = state.GetContext();
+	auto column_count = bind_data->Cast<JsonExtractColumnsBindData>().column_names.size();
+	return make_uniq<JsonExtractColumnsLocalState>(BufferAllocator::Get(context), column_count);
+}
+
+static void AppendJsonValue(string &target, yyjson_val *val, yyjson_alc *alc) {
+	switch (yyjson_get_tag(val)) {
+	case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
+		target.append("null");
+		break;
+	case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
+		target.append("true");
+		break;
+	case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
+		target.append("false");
+		break;
+	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC:
+	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE: {
+		auto str = duckdb_yyjson::yyjson_get_str(val);
+		auto len = duckdb_yyjson::yyjson_get_len(val);
+		target.append(str, len);
+		break;
+	}
+	default: {
+		idx_t len;
+		auto data = JSONCommon::WriteVal<yyjson_val>(val, alc, len);
+		target.append(data, len);
+		break;
+	}
+	}
+}
+
+static unique_ptr<FunctionData> JsonExtractColumnsBind(ClientContext &context, ScalarFunction &function,
+                                                       vector<unique_ptr<Expression>> &arguments) {
+	if (arguments.size() < 2 || arguments.size() > 3) {
+		throw BinderException("json_extract_columns expects json input, columns mapping, and optional separator");
+	}
+	auto &columns_arg = arguments[1];
+	if (columns_arg->return_type.id() == LogicalTypeId::UNKNOWN || columns_arg->HasParameter()) {
+		throw ParameterNotResolvedException();
+	}
+	if (!columns_arg->IsFoldable()) {
+		throw BinderException("json_extract_columns columns argument must be constant");
+	}
+
+	auto columns_value = ExpressionExecutor::EvaluateScalar(context, *columns_arg);
+	if (columns_value.IsNull()) {
+		throw BinderException("json_extract_columns: columns argument must be a JSON object");
+	}
+	auto type_id = columns_value.type().id();
+	if (type_id != LogicalTypeId::VARCHAR) {
+		throw BinderException("json_extract_columns columns argument must be a JSON string");
+	}
+	auto columns_input = StringValue::Get(columns_value);
+
+	duckdb_yyjson::yyjson_read_err err;
+	auto doc = yyjson_doc_ptr(yyjson_read_opts(const_cast<char *>(columns_input.c_str()), columns_input.size(),
+	                                           JSONCommon::READ_FLAG, nullptr, &err));
+	if (!doc) {
+		throw BinderException("json_extract_columns: %s",
+		                      JSONCommon::FormatParseError(columns_input.c_str(), columns_input.size(), err));
+	}
+	auto root = yyjson_doc_get_root(doc.get());
+	if (!root || !yyjson_is_obj(root)) {
+		throw BinderException("json_extract_columns: columns argument must be a JSON object");
+	}
+
+	vector<string> column_names;
+	vector<string> patterns;
+	child_list_t<LogicalType> children;
+	unordered_set<string> seen_columns;
+
+	yyjson_val *key = nullptr;
+	yyjson_obj_iter iter = yyjson_obj_iter_with(root);
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		auto key_str = duckdb_yyjson::yyjson_get_str(key);
+		auto key_len = duckdb_yyjson::yyjson_get_len(key);
+		auto value = yyjson_obj_iter_get_val(key);
+		if (!yyjson_is_str(value)) {
+			throw BinderException("json_extract_columns: column patterns must be strings");
+		}
+		string column_name(key_str, key_len);
+		if (!seen_columns.insert(column_name).second) {
+			throw BinderException("json_extract_columns: duplicate output column name \"%s\"", column_name.c_str());
+		}
+		auto pattern_str = string(duckdb_yyjson::yyjson_get_str(value), duckdb_yyjson::yyjson_get_len(value));
+		column_names.push_back(std::move(column_name));
+		patterns.push_back(std::move(pattern_str));
+	}
+
+	children.reserve(column_names.size());
+	for (idx_t i = 0; i < column_names.size(); i++) {
+		children.emplace_back(column_names[i], LogicalType::VARCHAR);
+	}
+	function.return_type = LogicalType::STRUCT(children);
+
+	duckdb_re2::RE2::Options options;
+	options.set_log_errors(false);
+	return make_uniq<JsonExtractColumnsBindData>(std::move(column_names), std::move(patterns), std::move(children),
+	                                             options);
+}
+
+static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<JsonExtractColumnsBindData>();
+	auto &local_state = ExecuteFunctionState::GetFunctionState(state)->Cast<JsonExtractColumnsLocalState>();
+
+	auto column_count = bind_data.column_names.size();
+	auto &children = StructVector::GetEntries(result);
+	D_ASSERT(children.size() == column_count);
+
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto &result_validity = FlatVector::Validity(result);
+	for (auto &child : children) {
+		child->SetVectorType(VectorType::FLAT_VECTOR);
+	}
+
+	vector<string_t *> child_data(column_count, nullptr);
+	vector<ValidityMask *> child_validities(column_count, nullptr);
+	for (idx_t i = 0; i < column_count; i++) {
+		child_data[i] = FlatVector::GetData<string_t>(*children[i]);
+		child_validities[i] = &FlatVector::Validity(*children[i]);
+	}
+
+	UnifiedVectorFormat json_data;
+	args.data[0].ToUnifiedFormat(args.size(), json_data);
+	auto json_inputs = UnifiedVectorFormat::GetData<string_t>(json_data);
+
+	auto has_separator_argument = args.ColumnCount() == 3;
+	idx_t separator_column_index = has_separator_argument ? args.ColumnCount() - 1 : 0;
+	bool separator_is_constant = false;
+	std::string separator_constant_storage;
+	const char *separator_constant_ptr = nullptr;
+	idx_t separator_constant_len = 0;
+	if (has_separator_argument) {
+		auto &separator_vec = args.data[separator_column_index];
+		separator_is_constant = separator_vec.GetVectorType() == VectorType::CONSTANT_VECTOR;
+		if (separator_is_constant) {
+			if (ConstantVector::IsNull(separator_vec)) {
+				throw InvalidInputException("json_extract_columns: separator cannot be NULL");
+			}
+			auto separator_value = separator_vec.GetValue(0);
+			separator_constant_storage = StringValue::Get(separator_value);
+			separator_constant_ptr = separator_constant_storage.c_str();
+			separator_constant_len = separator_constant_storage.size();
+		}
+	}
+
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto json_idx = json_data.sel->get_index(row);
+
+		std::string separator_storage;
+		const char *separator_data_ptr;
+		idx_t separator_len;
+		if (has_separator_argument) {
+			if (separator_is_constant) {
+				separator_data_ptr = separator_constant_ptr;
+				separator_len = separator_constant_len;
+			} else {
+				auto separator_value = args.GetValue(separator_column_index, row);
+				if (separator_value.IsNull()) {
+					throw InvalidInputException("json_extract_columns: separator cannot be NULL");
+				}
+				separator_storage = StringValue::Get(separator_value);
+				separator_data_ptr = separator_storage.c_str();
+				separator_len = separator_storage.size();
+			}
+		} else {
+			separator_data_ptr = "";
+			separator_len = 0;
+		}
+
+		if (!json_data.validity.RowIsValid(json_idx)) {
+			result_validity.SetInvalid(row);
+			for (auto &validity : child_validities) {
+				validity->SetInvalid(row);
+			}
+			continue;
+		}
+		result_validity.SetValid(row);
+
+		auto &allocator = *local_state.json_allocator;
+		allocator.Reset();
+		auto alc = allocator.GetYYAlc();
+
+		auto input = json_inputs[json_idx];
+		auto input_data = input.GetDataUnsafe();
+		auto input_length = input.GetSize();
+		duckdb_yyjson::yyjson_read_err err;
+		auto doc = yyjson_doc_ptr(
+		    yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err));
+		if (!doc) {
+			throw InvalidInputException("json_extract_columns: %s",
+			                            JSONCommon::FormatParseError(input_data, input_length, err));
+		}
+		auto root = yyjson_doc_get_root(doc.get());
+		if (!root || !yyjson_is_obj(root)) {
+			throw InvalidInputException("json_extract_columns: expected JSON object input");
+		}
+
+		for (auto &buffer : local_state.buffers) {
+			buffer.clear();
+		}
+		std::fill(local_state.has_match.begin(), local_state.has_match.end(), false);
+
+		yyjson_val *key = nullptr;
+		yyjson_obj_iter iter = yyjson_obj_iter_with(root);
+		while ((key = yyjson_obj_iter_next(&iter))) {
+			auto key_str = duckdb_yyjson::yyjson_get_str(key);
+			auto key_len = duckdb_yyjson::yyjson_get_len(key);
+			if (!key_str) {
+				throw InvalidInputException("json_extract_columns: encountered non-string object key");
+			}
+			auto value = yyjson_obj_iter_get_val(key);
+			duckdb_re2::StringPiece key_piece(key_str, key_len);
+			for (idx_t col_idx = 0; col_idx < column_count; col_idx++) {
+				auto &regex = *bind_data.compiled_patterns[col_idx];
+				if (!duckdb_re2::RE2::PartialMatch(key_piece, regex)) {
+					continue;
+				}
+				if (local_state.has_match[col_idx]) {
+					local_state.buffers[col_idx].append(separator_data_ptr, separator_len);
+				} else {
+					local_state.has_match[col_idx] = true;
+				}
+				AppendJsonValue(local_state.buffers[col_idx], value, alc);
+			}
+		}
+
+		for (idx_t col_idx = 0; col_idx < column_count; col_idx++) {
+			if (!local_state.has_match[col_idx]) {
+				child_validities[col_idx]->SetInvalid(row);
+				continue;
+			}
+			child_validities[col_idx]->SetValid(row);
+			child_data[col_idx][row] = StringVector::AddString(*children[col_idx], local_state.buffers[col_idx]);
+		}
+	}
+}
 
 // Default initial capacity for the key buffer
 constexpr idx_t DEFAULT_KEY_BUFFER_SIZE = 512;
@@ -825,31 +1123,30 @@ inline string_t JsonFlattenSingle(Vector &result, const string_t &input, JsonFla
 	auto input_data = input.GetDataUnsafe();
 	auto input_length = input.GetSize();
 	duckdb_yyjson::yyjson_read_err err;
-	auto doc = yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err);
+	auto doc = yyjson_doc_ptr(
+	    yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err));
 	if (!doc) {
 		throw InvalidInputException("json_flatten: %s", JSONCommon::FormatParseError(input_data, input_length, err));
 	}
-	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc_handle(doc, yyjson_doc_free);
-	auto root = yyjson_doc_get_root(doc);
+	auto root = yyjson_doc_get_root(doc.get());
 	if (!root || yyjson_is_null(root) || (!yyjson_is_obj(root) && !yyjson_is_arr(root))) {
 		return StringVector::AddString(result, input);
 	}
-	auto out_doc = yyjson_mut_doc_new(alc);
+	auto out_doc = yyjson_mut_doc_ptr(yyjson_mut_doc_new(alc));
 	if (!out_doc) {
 		throw InternalException("json_flatten: failed to allocate output document");
 	}
-	std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> out_handle(out_doc, yyjson_mut_doc_free);
-	auto out_root = yyjson_mut_obj(out_doc);
+	auto out_root = yyjson_mut_obj(out_doc.get());
 	if (!out_root) {
 		throw InternalException("json_flatten: failed to allocate output object");
 	}
-	yyjson_mut_doc_set_root(out_doc, out_root);
+	yyjson_mut_doc_set_root(out_doc.get(), out_root);
 	auto &key_buffer = local_state.key_buffer;
 	key_buffer.clear();
 	key_buffer.reserve(static_cast<size_t>(std::min<idx_t>(input_length, DEFAULT_KEY_BUFFER_SIZE)));
-	FlattenIntoObject(root, out_doc, out_root, key_buffer, separator, 0);
+	FlattenIntoObject(root, out_doc.get(), out_root, key_buffer, separator, 0);
 	size_t output_length = 0;
-	auto output_cstr = yyjson_mut_write_opts(out_doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
+	auto output_cstr = yyjson_mut_write_opts(out_doc.get(), JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
 	if (!output_cstr) {
 		throw InternalException("json_flatten: failed to serialize flattened JSON");
 	}
@@ -865,27 +1162,26 @@ inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const
 	auto input_data = input.GetDataUnsafe();
 	auto input_length = input.GetSize();
 	duckdb_yyjson::yyjson_read_err err;
-	auto doc = yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err);
+	auto doc = yyjson_doc_ptr(
+	    yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err));
 	if (!doc) {
 		throw InvalidInputException("json_add_prefix: %s", JSONCommon::FormatParseError(input_data, input_length, err));
 	}
 
-	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc_handle(doc, yyjson_doc_free);
-	auto root = yyjson_doc_get_root(doc);
+	auto root = yyjson_doc_get_root(doc.get());
 	if (!root || !yyjson_is_obj(root)) {
 		throw InvalidInputException("json_add_prefix: expected JSON object input");
 	}
 
-	auto out_doc = yyjson_mut_doc_new(alc);
+	auto out_doc = yyjson_mut_doc_ptr(yyjson_mut_doc_new(alc));
 	if (!out_doc) {
 		throw InternalException("json_add_prefix: failed to allocate output document");
 	}
-	std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> out_handle(out_doc, yyjson_mut_doc_free);
-	auto out_root = yyjson_mut_obj(out_doc);
+	auto out_root = yyjson_mut_obj(out_doc.get());
 	if (!out_root) {
 		throw InternalException("json_add_prefix: failed to allocate output object");
 	}
-	yyjson_mut_doc_set_root(out_doc, out_root);
+	yyjson_mut_doc_set_root(out_doc.get(), out_root);
 
 	auto prefix_data = prefix.GetDataUnsafe();
 	auto prefix_length = prefix.GetSize();
@@ -906,14 +1202,14 @@ inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const
 			// Use stack buffer for common case
 			memcpy(buffer, prefix_data, prefix_length);
 			memcpy(buffer + prefix_length, key_str, key_len);
-			new_key_val = yyjson_mut_strncpy(out_doc, buffer, prefixed_len);
+			new_key_val = yyjson_mut_strncpy(out_doc.get(), buffer, prefixed_len);
 		} else {
 			// Fallback to heap for large keys
 			std::string new_key;
 			new_key.reserve(prefixed_len);
 			new_key.append(prefix_data, prefix_length);
 			new_key.append(key_str, key_len);
-			new_key_val = yyjson_mut_strncpy(out_doc, new_key.c_str(), prefixed_len);
+			new_key_val = yyjson_mut_strncpy(out_doc.get(), new_key.c_str(), prefixed_len);
 		}
 
 		if (!new_key_val) {
@@ -921,18 +1217,18 @@ inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const
 		}
 		auto new_key_ptr = duckdb_yyjson::yyjson_mut_get_str(new_key_val);
 
-		auto value_copy = yyjson_val_mut_copy(out_doc, value);
+		auto value_copy = yyjson_val_mut_copy(out_doc.get(), value);
 		if (!value_copy) {
 			throw InternalException("json_add_prefix: failed to allocate value storage");
 		}
 
-		if (!yyjson_mut_obj_add_val(out_doc, out_root, new_key_ptr, value_copy)) {
+		if (!yyjson_mut_obj_add_val(out_doc.get(), out_root, new_key_ptr, value_copy)) {
 			throw InternalException("json_add_prefix: failed to add prefixed key-value pair");
 		}
 	}
 
 	size_t output_length = 0;
-	auto output_cstr = yyjson_mut_write_opts(out_doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
+	auto output_cstr = yyjson_mut_write_opts(out_doc.get(), JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
 	if (!output_cstr) {
 		throw InternalException("json_add_prefix: failed to serialize output JSON");
 	}
@@ -969,6 +1265,19 @@ inline void JsonAddPrefixScalarFun(DataChunk &args, ExpressionState &state, Vect
 }
 
 static void LoadInternal(JsonToolsLoadContext &ctx) {
+	child_list_t<LogicalType> empty_children;
+	auto json_extract_columns_function =
+	    ScalarFunction("json_extract_columns", {LogicalType::JSON(), LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                   LogicalType::STRUCT(empty_children), JsonExtractColumnsFunction, JsonExtractColumnsBind, nullptr,
+	                   nullptr, JsonExtractColumnsInitLocalState);
+	json_extract_columns_function.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	RegisterScalarFunction(ctx, json_extract_columns_function);
+	auto json_extract_columns_default_separator_function = ScalarFunction(
+	    "json_extract_columns", {LogicalType::JSON(), LogicalType::VARCHAR}, LogicalType::STRUCT(empty_children),
+	    JsonExtractColumnsFunction, JsonExtractColumnsBind, nullptr, nullptr, JsonExtractColumnsInitLocalState);
+	json_extract_columns_default_separator_function.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	RegisterScalarFunction(ctx, json_extract_columns_default_separator_function);
+
 	auto json_flatten_scalar_function =
 	    ScalarFunction("json_flatten", {LogicalType::JSON()}, LogicalType::JSON(), JsonFlattenScalarFun, nullptr,
 	                   nullptr, nullptr, JsonFlattenInitLocalState);
