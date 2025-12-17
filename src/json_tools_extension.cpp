@@ -836,8 +836,8 @@ static void AppendJsonValue(string &target, yyjson_val *val, yyjson_alc *alc) {
 
 static unique_ptr<FunctionData> JsonExtractColumnsBind(ClientContext &context, ScalarFunction &function,
                                                        vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() != 3) {
-		throw BinderException("json_extract_columns expects json input, columns mapping, and separator");
+	if (arguments.size() < 2 || arguments.size() > 3) {
+		throw BinderException("json_extract_columns expects json input, columns mapping, and optional separator");
 	}
 	auto &columns_arg = arguments[1];
 	if (columns_arg->return_type.id() == LogicalTypeId::UNKNOWN || columns_arg->HasParameter()) {
@@ -898,7 +898,6 @@ static unique_ptr<FunctionData> JsonExtractColumnsBind(ClientContext &context, S
 		children.emplace_back(column_names[i], LogicalType::VARCHAR);
 	}
 	function.return_type = LogicalType::STRUCT(children);
-	Function::EraseArgument(function, arguments, 1);
 
 	duckdb_re2::RE2::Options options;
 	options.set_log_errors(false);
@@ -929,19 +928,51 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 	}
 
 	UnifiedVectorFormat json_data;
-	UnifiedVectorFormat separator_data;
 	args.data[0].ToUnifiedFormat(args.size(), json_data);
-	args.data[1].ToUnifiedFormat(args.size(), separator_data);
-
 	auto json_inputs = UnifiedVectorFormat::GetData<string_t>(json_data);
-	auto separator_inputs = UnifiedVectorFormat::GetData<string_t>(separator_data);
+
+	auto has_separator_argument = args.ColumnCount() == 3;
+	idx_t separator_column_index = has_separator_argument ? args.ColumnCount() - 1 : 0;
+	bool separator_is_constant = false;
+	std::string separator_constant_storage;
+	const char *separator_constant_ptr = nullptr;
+	idx_t separator_constant_len = 0;
+	if (has_separator_argument) {
+		auto &separator_vec = args.data[separator_column_index];
+		separator_is_constant = separator_vec.GetVectorType() == VectorType::CONSTANT_VECTOR;
+		if (separator_is_constant) {
+			if (ConstantVector::IsNull(separator_vec)) {
+				throw InvalidInputException("json_extract_columns: separator cannot be NULL");
+			}
+			auto separator_value = separator_vec.GetValue(0);
+			separator_constant_storage = StringValue::Get(separator_value);
+			separator_constant_ptr = separator_constant_storage.c_str();
+			separator_constant_len = separator_constant_storage.size();
+		}
+	}
 
 	for (idx_t row = 0; row < args.size(); row++) {
 		auto json_idx = json_data.sel->get_index(row);
-		auto separator_idx = separator_data.sel->get_index(row);
 
-		if (!separator_data.validity.RowIsValid(separator_idx)) {
-			throw InvalidInputException("json_extract_columns: separator cannot be NULL");
+		std::string separator_storage;
+		const char *separator_data_ptr;
+		idx_t separator_len;
+		if (has_separator_argument) {
+			if (separator_is_constant) {
+				separator_data_ptr = separator_constant_ptr;
+				separator_len = separator_constant_len;
+			} else {
+				auto separator_value = args.GetValue(separator_column_index, row);
+				if (separator_value.IsNull()) {
+					throw InvalidInputException("json_extract_columns: separator cannot be NULL");
+				}
+				separator_storage = StringValue::Get(separator_value);
+				separator_data_ptr = separator_storage.c_str();
+				separator_len = separator_storage.size();
+			}
+		} else {
+			separator_data_ptr = "";
+			separator_len = 0;
 		}
 
 		if (!json_data.validity.RowIsValid(json_idx)) {
@@ -976,10 +1007,6 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 			buffer.clear();
 		}
 		std::fill(local_state.has_match.begin(), local_state.has_match.end(), false);
-
-		auto separator = separator_inputs[separator_idx];
-		auto separator_data_ptr = separator.GetDataUnsafe();
-		auto separator_len = separator.GetSize();
 
 		yyjson_val *key = nullptr;
 		yyjson_obj_iter iter = yyjson_obj_iter_with(root);
@@ -1243,11 +1270,16 @@ inline void JsonAddPrefixScalarFun(DataChunk &args, ExpressionState &state, Vect
 static void LoadInternal(JsonToolsLoadContext &ctx) {
 	child_list_t<LogicalType> empty_children;
 	auto json_extract_columns_function =
-	    ScalarFunction("json_extract_columns", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    ScalarFunction("json_extract_columns", {LogicalType::JSON(), LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                   LogicalType::STRUCT(empty_children), JsonExtractColumnsFunction, JsonExtractColumnsBind, nullptr,
 	                   nullptr, JsonExtractColumnsInitLocalState);
 	json_extract_columns_function.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 	RegisterScalarFunction(ctx, json_extract_columns_function);
+	auto json_extract_columns_default_separator_function = ScalarFunction(
+	    "json_extract_columns", {LogicalType::JSON(), LogicalType::VARCHAR}, LogicalType::STRUCT(empty_children),
+	    JsonExtractColumnsFunction, JsonExtractColumnsBind, nullptr, nullptr, JsonExtractColumnsInitLocalState);
+	json_extract_columns_default_separator_function.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+	RegisterScalarFunction(ctx, json_extract_columns_default_separator_function);
 
 	auto json_flatten_scalar_function =
 	    ScalarFunction("json_flatten", {LogicalType::JSON()}, LogicalType::JSON(), JsonFlattenScalarFun, nullptr,

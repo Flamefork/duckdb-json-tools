@@ -27,6 +27,11 @@ SELECT (json_extract_columns('{"x":"a","xx":"b"}', '{"col":"x"}', '')).col;
 ab
 
 query I
+SELECT (json_extract_columns('{"x":"a","xx":"b"}', '{"col":"x"}')).col;
+----
+ab
+
+query I
 SELECT (json_extract_columns('{"abc":1,"xabcx":2}', '{"v":"abc"}', ',')).v;
 ----
 1,2
@@ -70,6 +75,11 @@ true
 # Separator NULL errors
 statement error
 SELECT json_extract_columns('{"a":1}', '{"a":"a"}', NULL);
+----
+Invalid Input Error: json_extract_columns: separator cannot be NULL
+
+statement error
+SELECT json_extract_columns(NULL, '{"a":"a"}', NULL);
 ----
 Invalid Input Error: json_extract_columns: separator cannot be NULL
 

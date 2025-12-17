@@ -13,6 +13,7 @@ This extension provides a set of utility functions to work with JSON data, focus
 
 - **`json_flatten(json[, separator])`**: Recursively flattens nested JSON objects and arrays into a single-level object with path keys (default separator: `.`).
 - **`json_add_prefix(json, text)`**: Adds a string prefix to every top-level key in a JSON object.
+- **`json_extract_columns(json, columns[, separator])`**: Pulls selected root keys into a struct of `VARCHAR` fields using regex patterns.
 - **`json_group_merge(json [ORDER BY ...])`**: Streams JSON patches with RFC 7396 merge semantics without materializing intermediate lists.
 
 ## Quick Start
@@ -124,6 +125,33 @@ SELECT json_add_prefix('{"user": {"name": "Alice"}, "count": 5}', 'data_');
 
 **Note:** This function requires the input to be a JSON object. It will raise an error if given a JSON array or primitive value.
 
+### `json_extract_columns(json, columns[, separator]) -> struct`
+
+Extracts selected root-level fields into a struct of `VARCHAR` columns. The first argument must be a JSON object value (not an array or primitive). `columns` must be a constant JSON object mapping output column names to RE2 regex patterns evaluated against each top-level key (partial matches by default; add anchors to tighten). Patterns are case-sensitive unless you supply inline flags such as `(?i)`. Output columns follow the mapping order.
+
+`separator` defaults to `''` and is inserted between multiple matches for the same column in the order keys appear in the input object. It can be empty but cannot be `NULL` (even when the JSON input is `NULL`). Columns with no matches return `NULL`.
+
+Values are stringified: strings pass through unquoted; arrays, objects, numbers, booleans, and `null` become their JSON text.
+
+**Examples:**
+```sql
+SELECT (json_extract_columns('{"id": 5, "name": "duck"}',
+                             '{"id":"^id$","name":"^name$"}', ',')).id AS id;
+-- Result: 5
+
+SELECT (json_extract_columns('{"a":1,"a2":2,"b":3}',
+                             '{"a":"^a","b":"^b$"}', '|')).a AS a_values;
+-- Result: 1|2
+
+SELECT (json_extract_columns('{"Key": "Value"}',
+                             '{"k":"(?i)^key$"}', ',')).k AS case_insensitive;
+-- Result: Value
+
+SELECT (json_extract_columns('{"x":"a","xx":"b"}',
+                             '{"col":"x"}')).col AS default_separator;
+-- Result: ab
+```
+
 ### `json_group_merge(json_expr [, treat_null_values] [ORDER BY ...]) -> json`
 
 Applies a sequence of JSON patches using [RFC 7396](https://datatracker.ietf.org/doc/html/rfc7396) merge semantics. Inputs can be `JSON` values or `VARCHAR` text that parses as JSON. SQL `NULL` rows are skipped, and the aggregate returns `'{}'::json` when no non-null inputs are provided.
@@ -175,6 +203,7 @@ FROM (VALUES ('{"keep":1}'::json, 1), ('{"keep":null}'::json, 2)) AS t(patch, ts
 
 - `json_flatten()` returns an error for malformed JSON
 - `json_add_prefix()` requires a JSON object (not array or primitive value)
+- `json_extract_columns()` requires a JSON object input and a constant JSON object of string regex patterns; it raises on invalid regexes, NULL separators, non-string object keys, or mismatched input shapes
 - `json_group_merge()` surfaces DuckDB JSON parse errors for invalid text and raises on merge buffers that exceed DuckDB limits
 - Maximum nesting depth: 1000 levels
 - Empty objects (`{}`) and arrays (`[]`) are omitted from flattened output
