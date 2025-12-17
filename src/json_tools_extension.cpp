@@ -858,14 +858,13 @@ static unique_ptr<FunctionData> JsonExtractColumnsBind(ClientContext &context, S
 	auto columns_input = StringValue::Get(columns_value);
 
 	duckdb_yyjson::yyjson_read_err err;
-	auto doc = yyjson_read_opts(const_cast<char *>(columns_input.c_str()), columns_input.size(), JSONCommon::READ_FLAG,
-	                            nullptr, &err);
+	auto doc = yyjson_doc_ptr(yyjson_read_opts(const_cast<char *>(columns_input.c_str()), columns_input.size(),
+	                                           JSONCommon::READ_FLAG, nullptr, &err));
 	if (!doc) {
 		throw BinderException("json_extract_columns: %s",
 		                      JSONCommon::FormatParseError(columns_input.c_str(), columns_input.size(), err));
 	}
-	std::unique_ptr<yyjson_doc, yyjson_doc_deleter> doc_handle(doc);
-	auto root = yyjson_doc_get_root(doc);
+	auto root = yyjson_doc_get_root(doc.get());
 	if (!root || !yyjson_is_obj(root)) {
 		throw BinderException("json_extract_columns: columns argument must be a JSON object");
 	}
@@ -992,13 +991,13 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 		auto input_data = input.GetDataUnsafe();
 		auto input_length = input.GetSize();
 		duckdb_yyjson::yyjson_read_err err;
-		auto doc = yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err);
+		auto doc = yyjson_doc_ptr(
+		    yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err));
 		if (!doc) {
 			throw InvalidInputException("json_extract_columns: %s",
 			                            JSONCommon::FormatParseError(input_data, input_length, err));
 		}
-		std::unique_ptr<yyjson_doc, yyjson_doc_deleter> doc_handle(doc);
-		auto root = yyjson_doc_get_root(doc);
+		auto root = yyjson_doc_get_root(doc.get());
 		if (!root || !yyjson_is_obj(root)) {
 			throw InvalidInputException("json_extract_columns: expected JSON object input");
 		}
@@ -1124,31 +1123,30 @@ inline string_t JsonFlattenSingle(Vector &result, const string_t &input, JsonFla
 	auto input_data = input.GetDataUnsafe();
 	auto input_length = input.GetSize();
 	duckdb_yyjson::yyjson_read_err err;
-	auto doc = yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err);
+	auto doc = yyjson_doc_ptr(
+	    yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err));
 	if (!doc) {
 		throw InvalidInputException("json_flatten: %s", JSONCommon::FormatParseError(input_data, input_length, err));
 	}
-	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc_handle(doc, yyjson_doc_free);
-	auto root = yyjson_doc_get_root(doc);
+	auto root = yyjson_doc_get_root(doc.get());
 	if (!root || yyjson_is_null(root) || (!yyjson_is_obj(root) && !yyjson_is_arr(root))) {
 		return StringVector::AddString(result, input);
 	}
-	auto out_doc = yyjson_mut_doc_new(alc);
+	auto out_doc = yyjson_mut_doc_ptr(yyjson_mut_doc_new(alc));
 	if (!out_doc) {
 		throw InternalException("json_flatten: failed to allocate output document");
 	}
-	std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> out_handle(out_doc, yyjson_mut_doc_free);
-	auto out_root = yyjson_mut_obj(out_doc);
+	auto out_root = yyjson_mut_obj(out_doc.get());
 	if (!out_root) {
 		throw InternalException("json_flatten: failed to allocate output object");
 	}
-	yyjson_mut_doc_set_root(out_doc, out_root);
+	yyjson_mut_doc_set_root(out_doc.get(), out_root);
 	auto &key_buffer = local_state.key_buffer;
 	key_buffer.clear();
 	key_buffer.reserve(static_cast<size_t>(std::min<idx_t>(input_length, DEFAULT_KEY_BUFFER_SIZE)));
-	FlattenIntoObject(root, out_doc, out_root, key_buffer, separator, 0);
+	FlattenIntoObject(root, out_doc.get(), out_root, key_buffer, separator, 0);
 	size_t output_length = 0;
-	auto output_cstr = yyjson_mut_write_opts(out_doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
+	auto output_cstr = yyjson_mut_write_opts(out_doc.get(), JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
 	if (!output_cstr) {
 		throw InternalException("json_flatten: failed to serialize flattened JSON");
 	}
@@ -1164,27 +1162,26 @@ inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const
 	auto input_data = input.GetDataUnsafe();
 	auto input_length = input.GetSize();
 	duckdb_yyjson::yyjson_read_err err;
-	auto doc = yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err);
+	auto doc = yyjson_doc_ptr(
+	    yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err));
 	if (!doc) {
 		throw InvalidInputException("json_add_prefix: %s", JSONCommon::FormatParseError(input_data, input_length, err));
 	}
 
-	std::unique_ptr<yyjson_doc, decltype(&yyjson_doc_free)> doc_handle(doc, yyjson_doc_free);
-	auto root = yyjson_doc_get_root(doc);
+	auto root = yyjson_doc_get_root(doc.get());
 	if (!root || !yyjson_is_obj(root)) {
 		throw InvalidInputException("json_add_prefix: expected JSON object input");
 	}
 
-	auto out_doc = yyjson_mut_doc_new(alc);
+	auto out_doc = yyjson_mut_doc_ptr(yyjson_mut_doc_new(alc));
 	if (!out_doc) {
 		throw InternalException("json_add_prefix: failed to allocate output document");
 	}
-	std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> out_handle(out_doc, yyjson_mut_doc_free);
-	auto out_root = yyjson_mut_obj(out_doc);
+	auto out_root = yyjson_mut_obj(out_doc.get());
 	if (!out_root) {
 		throw InternalException("json_add_prefix: failed to allocate output object");
 	}
-	yyjson_mut_doc_set_root(out_doc, out_root);
+	yyjson_mut_doc_set_root(out_doc.get(), out_root);
 
 	auto prefix_data = prefix.GetDataUnsafe();
 	auto prefix_length = prefix.GetSize();
@@ -1205,14 +1202,14 @@ inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const
 			// Use stack buffer for common case
 			memcpy(buffer, prefix_data, prefix_length);
 			memcpy(buffer + prefix_length, key_str, key_len);
-			new_key_val = yyjson_mut_strncpy(out_doc, buffer, prefixed_len);
+			new_key_val = yyjson_mut_strncpy(out_doc.get(), buffer, prefixed_len);
 		} else {
 			// Fallback to heap for large keys
 			std::string new_key;
 			new_key.reserve(prefixed_len);
 			new_key.append(prefix_data, prefix_length);
 			new_key.append(key_str, key_len);
-			new_key_val = yyjson_mut_strncpy(out_doc, new_key.c_str(), prefixed_len);
+			new_key_val = yyjson_mut_strncpy(out_doc.get(), new_key.c_str(), prefixed_len);
 		}
 
 		if (!new_key_val) {
@@ -1220,18 +1217,18 @@ inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const
 		}
 		auto new_key_ptr = duckdb_yyjson::yyjson_mut_get_str(new_key_val);
 
-		auto value_copy = yyjson_val_mut_copy(out_doc, value);
+		auto value_copy = yyjson_val_mut_copy(out_doc.get(), value);
 		if (!value_copy) {
 			throw InternalException("json_add_prefix: failed to allocate value storage");
 		}
 
-		if (!yyjson_mut_obj_add_val(out_doc, out_root, new_key_ptr, value_copy)) {
+		if (!yyjson_mut_obj_add_val(out_doc.get(), out_root, new_key_ptr, value_copy)) {
 			throw InternalException("json_add_prefix: failed to add prefixed key-value pair");
 		}
 	}
 
 	size_t output_length = 0;
-	auto output_cstr = yyjson_mut_write_opts(out_doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
+	auto output_cstr = yyjson_mut_write_opts(out_doc.get(), JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
 	if (!output_cstr) {
 		throw InternalException("json_add_prefix: failed to serialize output JSON");
 	}
