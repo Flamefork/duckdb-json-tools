@@ -4,6 +4,9 @@
 
 require json_tools
 
+# Ensure helper constructors from the json extension are available
+require json
+
 # Basic extraction
 query I
 SELECT (json_extract_columns('{"id": 5, "name": "duck"}', '{"id": "^id$", "name": "^name$"}', ',')).id;
@@ -108,3 +111,8 @@ statement error
 SELECT json_extract_columns('{"a":1}', '{"a":"["}', ',');
 ----
 <REGEX>:.*json_extract_columns: missing ].*
+
+statement error
+SELECT to_json(json_extract_columns('{"a":1}', '{}', ','));
+----
+Binder Error: json_extract_columns: column patterns must not be empty

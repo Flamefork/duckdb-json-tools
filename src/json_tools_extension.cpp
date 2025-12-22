@@ -891,6 +891,9 @@ static unique_ptr<FunctionData> JsonExtractColumnsBind(ClientContext &context, S
 		column_names.push_back(std::move(column_name));
 		patterns.push_back(std::move(pattern_str));
 	}
+	if (column_names.empty()) {
+		throw BinderException("json_extract_columns: column patterns must not be empty");
+	}
 
 	children.reserve(column_names.size());
 	for (idx_t i = 0; i < column_names.size(); i++) {
