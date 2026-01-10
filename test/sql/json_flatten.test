@@ -293,3 +293,18 @@ query I
 SELECT json_flatten('{"a": {"": {"b": 1}}}');
 ----
 {"a..b":1}
+
+# ========================================
+# Serialization Bug Regression
+# ========================================
+
+# This query triggers the bind function with a separator.
+# If EraseArgument is used, serialization/deserialization will fail
+# because the function signature changes (2 args -> 1 arg).
+statement ok
+PRAGMA verify_serializer;
+
+query I
+SELECT json_flatten('{"serialization": "test"}', '.');
+----
+{"serialization":"test"}

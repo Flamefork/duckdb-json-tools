@@ -329,3 +329,19 @@ ORDER BY grp;
 5	{"a":1}
 6	{"a":1}
 7	{"a":1}
+
+# ========================================
+# Serialization Bug Regression
+# ========================================
+
+# Verify that 'IGNORE NULLS' is preserved after serialization/deserialization.
+# If the argument is erased during bind, re-bind might default to 'DELETE NULLS'.
+
+statement ok
+PRAGMA verify_serializer;
+
+query I
+SELECT json_group_merge(patch, 'IGNORE NULLS' ORDER BY ts)
+FROM (VALUES ('{"a":1}'::json, 1), ('{"a":null}'::json, 2)) AS t(patch, ts);
+----
+{"a":1}

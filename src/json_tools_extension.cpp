@@ -128,7 +128,6 @@ static unique_ptr<FunctionData> JsonFlattenBind(ClientContext &context, ScalarFu
 	if (UTF8CharacterCount(separator) != 1) {
 		throw BinderException("json_flatten separator must be a VARCHAR literal of length 1");
 	}
-	Function::EraseArgument(function, arguments, 1);
 	return make_uniq<JsonFlattenBindData>(std::move(separator));
 }
 
@@ -692,19 +691,30 @@ static unique_ptr<FunctionData> JsonGroupMergeBind(ClientContext &context, Aggre
 			throw InvalidInputException("json_group_merge: treat_null_values must be one of %s",
 			                            JsonGroupMergeNullOptionsText().c_str());
 		}
-		Function::EraseArgument(function, arguments, 1);
 	}
 	return make_uniq<JsonGroupMergeBindData>(treatment);
+}
+
+static constexpr idx_t kAggregatedInputCount = 1;
+
+static void JsonGroupMergeUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                 data_ptr_t state, idx_t count) {
+	AggregateFunction::UnaryUpdate<JsonGroupMergeState, string_t, JsonGroupMergeFunction>(
+	    inputs, aggr_input_data, kAggregatedInputCount, state, count);
+}
+
+static void JsonGroupMergeScatterUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                        Vector &states, idx_t count) {
+	AggregateFunction::UnaryScatterUpdate<JsonGroupMergeState, string_t, JsonGroupMergeFunction>(
+	    inputs, aggr_input_data, kAggregatedInputCount, states, count);
 }
 
 static AggregateFunction CreateJsonGroupMergeAggregate(const LogicalType &input_type) {
 	AggregateFunction function(
 	    "json_group_merge", {input_type}, LogicalType::JSON(), AggregateFunction::StateSize<JsonGroupMergeState>,
-	    AggregateFunction::StateInitialize<JsonGroupMergeState, JsonGroupMergeFunction>,
-	    AggregateFunction::UnaryScatterUpdate<JsonGroupMergeState, string_t, JsonGroupMergeFunction>,
+	    AggregateFunction::StateInitialize<JsonGroupMergeState, JsonGroupMergeFunction>, JsonGroupMergeScatterUpdate,
 	    AggregateFunction::StateCombine<JsonGroupMergeState, JsonGroupMergeFunction>,
-	    AggregateFunction::StateFinalize<JsonGroupMergeState, string_t, JsonGroupMergeFunction>,
-	    AggregateFunction::UnaryUpdate<JsonGroupMergeState, string_t, JsonGroupMergeFunction>);
+	    AggregateFunction::StateFinalize<JsonGroupMergeState, string_t, JsonGroupMergeFunction>, JsonGroupMergeUpdate);
 	function.destructor = AggregateFunction::StateDestroy<JsonGroupMergeState, JsonGroupMergeFunction>;
 	function.order_dependent = AggregateOrderDependent::ORDER_DEPENDENT;
 	function.bind = JsonGroupMergeBind;
