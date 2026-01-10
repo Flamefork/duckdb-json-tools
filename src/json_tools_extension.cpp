@@ -1077,7 +1077,7 @@ static void FlattenIntoObject(yyjson_val *node, yyjson_mut_doc *out_doc, yyjson_
 		while ((key = yyjson_obj_iter_next(&iter))) {
 			auto child = yyjson_obj_iter_get_val(key);
 			auto previous_size = key_buffer.size();
-			if (previous_size != 0) {
+			if (depth > 0) {
 				key_buffer.append(separator);
 			}
 			auto key_str = duckdb_yyjson::yyjson_get_str(key);
@@ -1092,7 +1092,7 @@ static void FlattenIntoObject(yyjson_val *node, yyjson_mut_doc *out_doc, yyjson_
 		idx_t index = 0;
 		while ((child = yyjson_arr_iter_next(&iter))) {
 			auto previous_size = key_buffer.size();
-			if (previous_size != 0) {
+			if (depth > 0) {
 				key_buffer.append(separator);
 			}
 			AppendIndexToKeyBuffer(key_buffer, index);

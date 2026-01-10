@@ -274,3 +274,22 @@ statement error
 SELECT json_flatten('{"a": 1}', sep) FROM (VALUES ('/')) t(sep);
 ----
 Binder Error: json_flatten separator argument must be constant
+
+# ========================================
+# Empty Key Bug Regression Tests
+# ========================================
+
+# Suspicion: Empty root key combined with nested key might lose the separator/root key presence.
+# Expected: ".a": 1 (if separator is dot)
+# If it returns "a": 1, we have a problem.
+query I
+SELECT json_flatten('{"": {"a": 1}}');
+----
+{".a":1}
+
+# Empty key in middle
+# Expected: "a..b": 1
+query I
+SELECT json_flatten('{"a": {"": {"b": 1}}}');
+----
+{"a..b":1}
