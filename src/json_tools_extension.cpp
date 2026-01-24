@@ -14,6 +14,7 @@
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/scalar/regexp.hpp"
+#include "re2/set.h"
 #include "../duckdb/extension/json/include/json_common.hpp"
 #include "yyjson.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
@@ -751,19 +752,49 @@ using duckdb_yyjson::yyjson_read_opts;
 using duckdb_yyjson::yyjson_val;
 using duckdb_yyjson::yyjson_val_mut_copy;
 
+// Hash function for JSON keys (FNV-1a)
+static inline uint64_t HashKeyBytes(const char *data, idx_t len) {
+	uint64_t hash = 14695981039346656037ULL;
+	for (idx_t i = 0; i < len; i++) {
+		hash ^= static_cast<uint64_t>(static_cast<uint8_t>(data[i]));
+		hash *= 1099511628211ULL;
+	}
+	return hash;
+}
+
+// Count trailing zeros for bitset iteration (x must be non-zero)
+static inline idx_t CountTrailingZeros(uint64_t x) {
+	D_ASSERT(x != 0);
+#if defined(__GNUC__) || defined(__clang__)
+	return static_cast<idx_t>(__builtin_ctzll(x));
+#elif defined(_MSC_VER)
+	unsigned long idx;
+	_BitScanForward64(&idx, x);
+	return static_cast<idx_t>(idx);
+#else
+	idx_t count = 0;
+	while ((x & 1) == 0) {
+		x >>= 1;
+		count++;
+	}
+	return count;
+#endif
+}
+
 struct JsonExtractColumnsBindData : public FunctionData {
 	JsonExtractColumnsBindData(vector<string> column_names_p, vector<string> patterns_p,
 	                           child_list_t<LogicalType> children_p, duckdb_re2::RE2::Options options_p)
 	    : column_names(std::move(column_names_p)), patterns(std::move(patterns_p)), children(std::move(children_p)),
-	      options(std::move(options_p)) {
-		CompilePatterns();
+	      options(std::move(options_p)), column_count(this->patterns.size()) {
+		BuildPatternSet();
 	}
 
 	vector<string> column_names;
 	vector<string> patterns;
 	child_list_t<LogicalType> children;
 	duckdb_re2::RE2::Options options;
-	vector<unique_ptr<duckdb_re2::RE2>> compiled_patterns;
+	unique_ptr<duckdb_re2::RE2::Set> pattern_set;
+	idx_t column_count;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<JsonExtractColumnsBindData>(column_names, patterns, children, options);
@@ -776,28 +807,204 @@ struct JsonExtractColumnsBindData : public FunctionData {
 	}
 
 private:
-	void CompilePatterns() {
-		compiled_patterns.clear();
-		compiled_patterns.reserve(patterns.size());
-		for (auto &pattern : patterns) {
-			auto re = make_uniq<duckdb_re2::RE2>(pattern, options);
-			if (!re->ok()) {
-				throw BinderException("json_extract_columns: %s", re->error());
+	void BuildPatternSet() {
+		pattern_set = make_uniq<duckdb_re2::RE2::Set>(options, duckdb_re2::RE2::UNANCHORED);
+		for (idx_t i = 0; i < patterns.size(); i++) {
+			std::string error;
+			int idx = pattern_set->Add(patterns[i], &error);
+			if (idx < 0) {
+				throw BinderException("json_extract_columns: %s", error);
 			}
-			compiled_patterns.push_back(std::move(re));
+			D_ASSERT(static_cast<idx_t>(idx) == i);
 		}
+		if (!pattern_set->Compile()) {
+			throw BinderException("json_extract_columns: failed to compile pattern set");
+		}
+	}
+};
+
+// Cache for key→matched columns mapping
+static constexpr idx_t KEY_MATCH_CACHE_SIZE = 8192;
+static constexpr idx_t KEY_MATCH_CACHE_WAYS = 2;
+static constexpr idx_t KEY_MATCH_CACHE_SETS = KEY_MATCH_CACHE_SIZE / KEY_MATCH_CACHE_WAYS;
+static constexpr idx_t KEY_MATCH_MAX_KEY_STORAGE = 256 * 1024;
+
+struct KeyMatchCacheEntry {
+	idx_t key_offset = 0;
+	idx_t key_len = 0;
+	uint64_t key_hash = 0;
+	uint64_t match_bitset = 0;
+	bool valid = false;
+};
+
+struct KeyMatchCache {
+	std::array<KeyMatchCacheEntry, KEY_MATCH_CACHE_SIZE> entries;
+	vector<char> key_storage;
+	idx_t key_storage_offset = 0;
+
+	KeyMatchCache() {
+		key_storage.resize(64 * 1024);
+	}
+
+	void Reset() {
+		for (auto &e : entries) {
+			e.valid = false;
+		}
+		key_storage_offset = 0;
+	}
+
+	bool IsFull() const {
+		return key_storage_offset >= KEY_MATCH_MAX_KEY_STORAGE;
+	}
+
+	const char *GetKeyData(const KeyMatchCacheEntry &entry) const {
+		return key_storage.data() + entry.key_offset;
+	}
+
+	// Returns true if entry was inserted, false if storage is exhausted
+	bool TryInsert(idx_t set_idx, const char *key_str, idx_t key_len, uint64_t key_hash, uint64_t match_bitset) {
+		// Find target slot: prefer invalid, else evict way 0
+		idx_t target_way = 0;
+		for (idx_t way = 0; way < KEY_MATCH_CACHE_WAYS; way++) {
+			if (!entries[set_idx + way].valid) {
+				target_way = way;
+				break;
+			}
+		}
+
+		// Grow storage if needed and possible
+		if (key_storage_offset + key_len > key_storage.size()) {
+			if (key_storage.size() >= KEY_MATCH_MAX_KEY_STORAGE) {
+				return false;
+			}
+			key_storage.resize(key_storage.size() + 64 * 1024);
+		}
+
+		auto &entry = entries[set_idx + target_way];
+		std::memcpy(key_storage.data() + key_storage_offset, key_str, key_len);
+		entry.key_offset = key_storage_offset;
+		key_storage_offset += key_len;
+		entry.key_len = key_len;
+		entry.key_hash = key_hash;
+		entry.match_bitset = match_bitset;
+		entry.valid = true;
+		return true;
+	}
+};
+
+// Chunked cache for >64 patterns - stores match results as array of uint64_t chunks
+struct ChunkedKeyMatchCacheEntry {
+	idx_t key_offset = 0;
+	idx_t key_len = 0;
+	uint64_t key_hash = 0;
+	idx_t match_offset = 0;
+	bool valid = false;
+};
+
+struct ChunkedKeyMatchCache {
+	std::array<ChunkedKeyMatchCacheEntry, KEY_MATCH_CACHE_SIZE> entries;
+	vector<char> key_storage;
+	vector<uint64_t> match_storage;
+	idx_t key_storage_offset = 0;
+	idx_t match_storage_offset = 0;
+	idx_t chunks_per_entry = 0;
+
+	void Init(idx_t column_count) {
+		chunks_per_entry = (column_count + 63) / 64;
+		key_storage.resize(64 * 1024);
+		match_storage.resize(KEY_MATCH_CACHE_SIZE * chunks_per_entry);
+	}
+
+	void Reset() {
+		for (auto &e : entries) {
+			e.valid = false;
+		}
+		key_storage_offset = 0;
+		match_storage_offset = 0;
+	}
+
+	bool IsFull() const {
+		return key_storage_offset >= KEY_MATCH_MAX_KEY_STORAGE ||
+		       match_storage_offset + chunks_per_entry > match_storage.size();
+	}
+
+	const char *GetKeyData(const ChunkedKeyMatchCacheEntry &entry) const {
+		return key_storage.data() + entry.key_offset;
+	}
+
+	const uint64_t *GetMatchChunks(const ChunkedKeyMatchCacheEntry &entry) const {
+		return match_storage.data() + entry.match_offset;
+	}
+
+	// Returns pointer to match chunks if inserted, nullptr if storage is exhausted
+	const uint64_t *TryInsert(idx_t set_idx, const char *key_str, idx_t key_len, uint64_t key_hash,
+	                          const vector<int> &match_results) {
+		if (match_storage_offset + chunks_per_entry > match_storage.size()) {
+			return nullptr;
+		}
+
+		// Find target slot: prefer invalid, else evict way 0
+		idx_t target_way = 0;
+		for (idx_t way = 0; way < KEY_MATCH_CACHE_WAYS; way++) {
+			if (!entries[set_idx + way].valid) {
+				target_way = way;
+				break;
+			}
+		}
+
+		// Grow key storage if needed and possible
+		if (key_storage_offset + key_len > key_storage.size()) {
+			if (key_storage.size() >= KEY_MATCH_MAX_KEY_STORAGE) {
+				return nullptr;
+			}
+			key_storage.resize(key_storage.size() + 64 * 1024);
+		}
+
+		auto &entry = entries[set_idx + target_way];
+
+		// Store key
+		std::memcpy(key_storage.data() + key_storage_offset, key_str, key_len);
+		entry.key_offset = key_storage_offset;
+		key_storage_offset += key_len;
+		entry.key_len = key_len;
+		entry.key_hash = key_hash;
+
+		// Store match chunks
+		idx_t match_offset = match_storage_offset;
+		match_storage_offset += chunks_per_entry;
+		uint64_t *chunks = match_storage.data() + match_offset;
+		std::memset(chunks, 0, chunks_per_entry * sizeof(uint64_t));
+		for (int idx : match_results) {
+			chunks[idx / 64] |= (1ULL << (idx % 64));
+		}
+		entry.match_offset = match_offset;
+		entry.valid = true;
+
+		return chunks;
 	}
 };
 
 struct JsonExtractColumnsLocalState : public FunctionLocalState {
 	JsonExtractColumnsLocalState(Allocator &allocator, idx_t column_count)
 	    : json_allocator(std::make_shared<JSONAllocator>(allocator)), buffers(column_count),
-	      has_match(column_count, false) {
+	      has_match(column_count, false), use_bitset_cache(column_count <= 64), column_count(column_count) {
+		match_results.reserve(column_count);
+		if (!use_bitset_cache) {
+			chunked_cache.Init(column_count);
+		}
 	}
 
 	shared_ptr<JSONAllocator> json_allocator;
 	vector<string> buffers;
 	vector<bool> has_match;
+
+	// Cache for key→matches (≤64 patterns)
+	KeyMatchCache cache;
+	// Chunked cache for key→matches (>64 patterns)
+	ChunkedKeyMatchCache chunked_cache;
+	vector<int> match_results;
+	bool use_bitset_cache;
+	idx_t column_count;
 };
 
 static unique_ptr<FunctionLocalState>
@@ -1007,6 +1214,22 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 		}
 		std::fill(local_state.has_match.begin(), local_state.has_match.end(), false);
 
+		// Reset cache if storage is full
+		auto &cache = local_state.cache;
+		auto &chunked_cache = local_state.chunked_cache;
+		if (local_state.use_bitset_cache) {
+			if (cache.IsFull()) {
+				cache.Reset();
+			}
+		} else {
+			if (chunked_cache.IsFull()) {
+				chunked_cache.Reset();
+			}
+		}
+
+		auto &pattern_set = *bind_data.pattern_set;
+		const bool use_bitset = local_state.use_bitset_cache;
+
 		yyjson_val *key = nullptr;
 		yyjson_obj_iter iter = yyjson_obj_iter_with(root);
 		while ((key = yyjson_obj_iter_next(&iter))) {
@@ -1015,19 +1238,113 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 			if (!key_str) {
 				throw InvalidInputException("json_extract_columns: encountered non-string object key");
 			}
+
+			// Hash the key for cache lookup
+			uint64_t key_hash = HashKeyBytes(key_str, key_len);
+			idx_t set_idx = (key_hash & (KEY_MATCH_CACHE_SETS - 1)) * KEY_MATCH_CACHE_WAYS;
+
 			auto value = yyjson_obj_iter_get_val(key);
-			duckdb_re2::StringPiece key_piece(key_str, key_len);
-			for (idx_t col_idx = 0; col_idx < column_count; col_idx++) {
-				auto &regex = *bind_data.compiled_patterns[col_idx];
-				if (!duckdb_re2::RE2::PartialMatch(key_piece, regex)) {
-					continue;
+
+			if (use_bitset) {
+				// Fast path for ≤64 columns: use cache with bitset
+				// Cache lookup (2-way associative)
+				bool cache_hit = false;
+				uint64_t match_bitset = 0;
+				for (idx_t way = 0; way < KEY_MATCH_CACHE_WAYS; way++) {
+					auto &entry = cache.entries[set_idx + way];
+					if (entry.valid && entry.key_hash == key_hash && entry.key_len == key_len &&
+					    std::memcmp(cache.GetKeyData(entry), key_str, key_len) == 0) {
+						cache_hit = true;
+						match_bitset = entry.match_bitset;
+						break;
+					}
 				}
-				if (local_state.has_match[col_idx]) {
-					local_state.buffers[col_idx].append(separator_data_ptr, separator_len);
-				} else {
-					local_state.has_match[col_idx] = true;
+
+				// On cache miss, compute matches and store in cache
+				if (!cache_hit) {
+					duckdb_re2::StringPiece key_piece(key_str, key_len);
+					local_state.match_results.clear();
+					pattern_set.Match(key_piece, &local_state.match_results);
+
+					// Convert to bitset
+					match_bitset = 0;
+					for (int idx : local_state.match_results) {
+						match_bitset |= (1ULL << idx);
+					}
+
+					cache.TryInsert(set_idx, key_str, key_len, key_hash, match_bitset);
 				}
-				AppendJsonValue(local_state.buffers[col_idx], value, alc);
+
+				// Iterate set bits
+				uint64_t remaining = match_bitset;
+				while (remaining != 0) {
+					idx_t col_idx = CountTrailingZeros(remaining);
+					remaining &= (remaining - 1);
+
+					if (local_state.has_match[col_idx]) {
+						local_state.buffers[col_idx].append(separator_data_ptr, separator_len);
+					} else {
+						local_state.has_match[col_idx] = true;
+					}
+					AppendJsonValue(local_state.buffers[col_idx], value, alc);
+				}
+			} else {
+				// Fallback for > 64 columns: use chunked cache
+				idx_t chunked_set_idx = (key_hash & (KEY_MATCH_CACHE_SETS - 1)) * KEY_MATCH_CACHE_WAYS;
+
+				// Cache lookup (2-way associative)
+				bool cache_hit = false;
+				const uint64_t *match_chunks = nullptr;
+				for (idx_t way = 0; way < KEY_MATCH_CACHE_WAYS; way++) {
+					auto &entry = chunked_cache.entries[chunked_set_idx + way];
+					if (entry.valid && entry.key_hash == key_hash && entry.key_len == key_len &&
+					    std::memcmp(chunked_cache.GetKeyData(entry), key_str, key_len) == 0) {
+						cache_hit = true;
+						match_chunks = chunked_cache.GetMatchChunks(entry);
+						break;
+					}
+				}
+
+				// On cache miss, compute matches and store in cache
+				if (!cache_hit) {
+					duckdb_re2::StringPiece key_piece(key_str, key_len);
+					local_state.match_results.clear();
+					pattern_set.Match(key_piece, &local_state.match_results);
+
+					match_chunks = chunked_cache.TryInsert(chunked_set_idx, key_str, key_len, key_hash,
+					                                       local_state.match_results);
+
+					// If cache insert failed, process directly from match_results
+					if (!match_chunks) {
+						for (int col_idx : local_state.match_results) {
+							if (local_state.has_match[col_idx]) {
+								local_state.buffers[col_idx].append(separator_data_ptr, separator_len);
+							} else {
+								local_state.has_match[col_idx] = true;
+							}
+							AppendJsonValue(local_state.buffers[col_idx], value, alc);
+						}
+						continue;
+					}
+				}
+
+				// Iterate over chunks and their set bits
+				for (idx_t chunk_idx = 0; chunk_idx < chunked_cache.chunks_per_entry; chunk_idx++) {
+					uint64_t remaining = match_chunks[chunk_idx];
+					idx_t base_col = chunk_idx * 64;
+					while (remaining != 0) {
+						idx_t bit_idx = CountTrailingZeros(remaining);
+						remaining &= (remaining - 1);
+						idx_t col_idx = base_col + bit_idx;
+
+						if (local_state.has_match[col_idx]) {
+							local_state.buffers[col_idx].append(separator_data_ptr, separator_len);
+						} else {
+							local_state.has_match[col_idx] = true;
+						}
+						AppendJsonValue(local_state.buffers[col_idx], value, alc);
+					}
+				}
 			}
 		}
 
