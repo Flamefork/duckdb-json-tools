@@ -31,7 +31,7 @@ def create_connection() -> duckdb.DuckDBPyConnection:
     return conn
 
 
-def build_query(function: str, scenario: str, data_path: Path) -> str:
+def build_query(scenario_config: dict, data_path: Path) -> str:
     """Build benchmark query with result consumption wrapper.
 
     All queries are wrapped with sum(length(CAST(... AS VARCHAR))) to:
@@ -40,43 +40,38 @@ def build_query(function: str, scenario: str, data_path: Path) -> str:
     """
     table = f"read_parquet('{data_path}')"
 
-    if function == "json_flatten":
-        return f"SELECT sum(length(CAST(json_flatten(json_nested, '.') AS VARCHAR))) FROM {table}"
+    match scenario_config["function"]:
+        case "json_flatten":
+            return f"""
+                SELECT sum(length(CAST(json_flatten(json_nested, '.') AS VARCHAR)))
+                FROM {table}
+            """
 
-    if function == "json_add_prefix":
-        return f"SELECT sum(length(CAST(json_add_prefix(json_flat, 'pfx_') AS VARCHAR))) FROM {table}"
+        case "json_add_prefix":
+            return f"""
+                SELECT sum(length(CAST(json_add_prefix(json_flat, 'pfx_') AS VARCHAR)))
+                FROM {table}
+            """
 
-    if function == "json_extract_columns":
-        # Build patterns based on typical flat keys
-        if scenario == "few_patterns":
-            patterns = {f"col_{i}": f"s{i}" for i in range(1, 6)}
-        elif scenario == "many_patterns":
-            patterns = {f"s{i}": f"s{i}" for i in range(1, 10)}
-            patterns.update({f"n{i}": f"n{i}" for i in range(1, 5)})
-            patterns.update({"nested_s": r"o1\.s\d+"})
-        else:  # extreme_patterns
-            patterns = {f"p_{i:04d}": f"pattern_{i:04d}" for i in range(1000)}
+        case "json_extract_columns":
+            patterns_json = json.dumps(scenario_config["patterns"]).replace("'", "''")
+            return f"""
+                SELECT sum(length(CAST(json_extract_columns(json_flat, '{patterns_json}', '\\n') AS VARCHAR)))
+                FROM {table}
+            """
 
-        import json as json_mod
-        patterns_json = json_mod.dumps(patterns).replace("'", "''")
-        return f"SELECT sum(length(CAST(json_extract_columns(json_flat, '{patterns_json}', '\\n') AS VARCHAR))) FROM {table}"
+        case "json_group_merge":
+            return f"""
+                SELECT sum(length(CAST(result AS VARCHAR)))
+                FROM (
+                    SELECT json_group_merge(json_flat{scenario_config['merge_opts']}) as result
+                    FROM {table}
+                    GROUP BY {scenario_config['group_col']}
+                )
+            """
 
-    if function == "json_group_merge":
-        if scenario == "few_groups":
-            group_col = "g1e1"
-        elif scenario == "medium_groups":
-            group_col = "g1e3"
-        else:  # ignore_nulls or many_groups
-            group_col = "g1e4"
-
-        # Wrap aggregate result in sum(length(...)) via subquery
-        if scenario == "ignore_nulls":
-            inner = f"SELECT json_group_merge(json_flat, 'IGNORE NULLS') as result FROM {table} GROUP BY {group_col}"
-        else:
-            inner = f"SELECT json_group_merge(json_flat) as result FROM {table} GROUP BY {group_col}"
-        return f"SELECT sum(length(CAST(result AS VARCHAR))) FROM ({inner})"
-
-    raise ValueError(f"Unknown function: {function}")
+        case _:
+            raise ValueError(f"Unknown function: {scenario_config['function']}")
 
 
 def collect_duckdb_profile(conn: duckdb.DuckDBPyConnection, query: str, profile_path: Path) -> None:
@@ -132,7 +127,7 @@ def run_benchmarks(
 
         print(f"Running {case_id}...", end=" ", flush=True)
 
-        query = build_query(function, scenario, data_path)
+        query = build_query(scenario_config, data_path)
 
         if profile:
             profile_dir = PROFILES_DIR / case_id.replace("/", "_")
