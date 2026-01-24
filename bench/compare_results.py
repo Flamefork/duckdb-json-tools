@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from config import RESULTS_DIR, DEFAULT_TOLERANCE_PCT, SCHEMA_VERSION, DEFAULT_MIN_EFFECT_MS, PROFILES_DIR
+
+
+def load_results(path: Path) -> dict | None:
+    """Load results from JSON file."""
+    json_path = path.with_suffix(".json")
+
+    if json_path.exists():
+        with open(json_path) as f:
+            return json.load(f)
+
+    return None
+
+
+def classify_case(
+    baseline_ms: float | None,
+    current_ms: float | None,
+    tolerance_pct: float,
+    min_effect_ms: float,
+) -> str:
+    """Classify a case as FASTER/SLOWER/UNCHANGED/MISSING_IN_*."""
+    if baseline_ms is None:
+        return "MISSING_IN_BASELINE"
+    if current_ms is None:
+        return "MISSING_IN_LATEST"
+
+    diff_ms = current_ms - baseline_ms
+    diff_pct = (diff_ms / baseline_ms) * 100 if baseline_ms != 0 else 0
+
+    # UNCHANGED if below min_effect_ms OR within tolerance
+    if abs(diff_ms) < min_effect_ms or abs(diff_pct) <= tolerance_pct:
+        return "UNCHANGED"
+
+    if diff_pct > tolerance_pct:
+        return "SLOWER"
+
+    if diff_pct < -tolerance_pct:
+        return "FASTER"
+
+    return "UNCHANGED"
+
+
+def diff_environment(baseline_env: dict | None, latest_env: dict | None) -> dict:
+    """Compare environment sections, return differences."""
+    if baseline_env is None or latest_env is None:
+        return {}
+
+    diffs = {}
+
+    # Flat keys to compare
+    flat_keys = ["build_type", "os", "arch", "cpu_model", "cpu_cores", "duckdb_version"]
+    for key in flat_keys:
+        baseline_val = baseline_env.get(key)
+        latest_val = latest_env.get(key)
+        if baseline_val != latest_val:
+            diffs[key] = {"baseline": baseline_val, "current": latest_val}
+
+    # Dataset nested comparison
+    baseline_ds = baseline_env.get("dataset", {})
+    latest_ds = latest_env.get("dataset", {})
+    for key in ["seed", "sizes", "complexity_weights"]:
+        baseline_val = baseline_ds.get(key)
+        latest_val = latest_ds.get(key)
+        if baseline_val != latest_val:
+            diffs[f"dataset.{key}"] = {"baseline": baseline_val, "current": latest_val}
+
+    return diffs
+
+
+def get_top_cases(cases: list[dict], status: str, n: int = 3) -> list[dict]:
+    """Get top N cases by absolute diff_pct for given status."""
+    filtered = [c for c in cases if c["status"] == status and "diff_pct" in c]
+    sorted_cases = sorted(filtered, key=lambda c: abs(c["diff_pct"]), reverse=True)
+    return [
+        {"id": c["id"], "diff_pct": c["diff_pct"], "diff_ms": c["diff_ms"]}
+        for c in sorted_cases[:n]
+    ]
+
+
+def get_profile_path(case_id: str) -> Path | None:
+    """Return profile path if exists for case."""
+    profile_dir = PROFILES_DIR / case_id.replace("/", "_")
+    profile_file = profile_dir / "query_profile.json"
+    if profile_file.exists():
+        return profile_file
+    return None
+
+
+def generate_diff(
+    baseline: dict,
+    latest: dict,
+    tolerance_pct: float,
+    min_effect_ms: float,
+) -> dict:
+    """Generate diff between baseline and latest results."""
+    baseline_by_id = {r["id"]: r for r in baseline["results"]}
+    latest_by_id = {r["id"]: r for r in latest["results"]}
+
+    all_ids = set(baseline_by_id.keys()) | set(latest_by_id.keys())
+
+    cases = []
+    for case_id in sorted(all_ids):
+        b = baseline_by_id.get(case_id)
+        l = latest_by_id.get(case_id)
+
+        baseline_ms = b["median_ms"] if b else None
+        current_ms = l["median_ms"] if l else None
+
+        status = classify_case(baseline_ms, current_ms, tolerance_pct, min_effect_ms)
+
+        case = {
+            "id": case_id,
+            "status": status,
+            "baseline_ms": baseline_ms,
+            "current_ms": current_ms,
+        }
+
+        if baseline_ms is not None and current_ms is not None:
+            case["diff_ms"] = round(current_ms - baseline_ms, 2)
+            case["diff_pct"] = round((current_ms - baseline_ms) / baseline_ms * 100, 2) if baseline_ms != 0 else 0
+
+        cases.append(case)
+
+    # Summary
+    statuses = [c["status"] for c in cases]
+    regressions = statuses.count("SLOWER")
+    improvements = statuses.count("FASTER")
+
+    worst_regression = 0.0
+    for c in cases:
+        if c["status"] == "SLOWER" and c.get("diff_pct", 0) > worst_regression:
+            worst_regression = c["diff_pct"]
+
+    env_diff = diff_environment(baseline.get("environment"), latest.get("environment"))
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "thresholds": {
+            "tolerance_pct": tolerance_pct,
+            "min_effect_ms": min_effect_ms,
+        },
+        "environment_diff": env_diff,
+        "summary": {
+            "total": len(cases),
+            "regressions": regressions,
+            "improvements": improvements,
+            "unchanged": statuses.count("UNCHANGED"),
+            "missing_in_baseline": statuses.count("MISSING_IN_BASELINE"),
+            "missing_in_latest": statuses.count("MISSING_IN_LATEST"),
+            "worst_regression_pct": worst_regression,
+            "top_regressions": get_top_cases(cases, "SLOWER", 3),
+            "top_improvements": get_top_cases(cases, "FASTER", 3),
+        },
+        "cases": cases,
+    }
+
+
+def print_diff(diff: dict, baseline: dict, latest: dict) -> None:
+    """Print human-readable diff summary."""
+    print(f"Comparing latest ({latest.get('generated_at', 'unknown')}) vs baseline ({baseline.get('generated_at', 'unknown')})")
+    print(f"Thresholds: tolerance={diff['thresholds']['tolerance_pct']}%, min_effect={diff['thresholds']['min_effect_ms']}ms")
+    print()
+
+    # Show environment differences
+    env_diff = diff.get("environment_diff", {})
+    if env_diff:
+        print("Environment differences:")
+        for key, val in env_diff.items():
+            print(f"  - {key}: {val['baseline']} -> {val['current']}")
+        print()
+
+    # Top regressions
+    top_reg = diff["summary"].get("top_regressions", [])
+    if top_reg:
+        print("Top regressions:")
+        for c in top_reg:
+            profile_path = get_profile_path(c["id"])
+            profile_str = f"  [profile: {profile_path}]" if profile_path else ""
+            print(f"  SLOWER   {c['id']:<45} +{c['diff_pct']:.1f}% (+{c['diff_ms']:.1f}ms){profile_str}")
+        print()
+
+    # Top improvements
+    top_imp = diff["summary"].get("top_improvements", [])
+    if top_imp:
+        print("Top improvements:")
+        for c in top_imp:
+            profile_path = get_profile_path(c["id"])
+            profile_str = f"  [profile: {profile_path}]" if profile_path else ""
+            print(f"  FASTER   {c['id']:<45} {c['diff_pct']:.1f}% ({c['diff_ms']:.1f}ms){profile_str}")
+        print()
+
+    # Other notable changes (not in top-3)
+    top_ids = {c["id"] for c in top_reg + top_imp}
+    other_changes = [c for c in diff["cases"] if c["status"] in ("SLOWER", "FASTER", "MISSING_IN_BASELINE", "MISSING_IN_LATEST") and c["id"] not in top_ids]
+
+    if other_changes:
+        print("Other changes:")
+        for case in other_changes:
+            status = case["status"]
+            case_id = case["id"]
+            if status == "SLOWER":
+                print(f"  SLOWER   {case_id:<45} +{case['diff_pct']:.1f}% (+{case['diff_ms']:.1f}ms)")
+            elif status == "FASTER":
+                print(f"  FASTER   {case_id:<45} {case['diff_pct']:.1f}% ({case['diff_ms']:.1f}ms)")
+            elif status == "MISSING_IN_BASELINE":
+                print(f"  NEW      {case_id:<45} (not in baseline)")
+            elif status == "MISSING_IN_LATEST":
+                print(f"  REMOVED  {case_id:<45} (not in latest)")
+        print()
+
+    s = diff["summary"]
+    print(f"Summary: {s['regressions']} regression(s), {s['improvements']} improvement(s), {s['unchanged']} unchanged")
+
+
+def save_diff(diff: dict, path: Path) -> None:
+    """Save diff to JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(diff, f, indent=2)
+
+
+def compare_results(
+    baseline_path: Path,
+    latest_path: Path,
+    output_path: Path,
+    tolerance_pct: float,
+    min_effect_ms: float,
+) -> int:
+    """Compare results and return exit code."""
+    latest = load_results(latest_path)
+    if latest is None:
+        print(f"Error: Latest results not found at {latest_path}")
+        print("Run benchmarks first: uv run python bench/run_benchmarks.py")
+        return 2
+
+    baseline = load_results(baseline_path)
+    if baseline is None:
+        print(f"Error: Baseline not found at {baseline_path}")
+        print("Save current results as baseline: uv run python bench/compare_results.py --save-baseline")
+        return 2
+
+    # Check schema version
+    baseline_version = baseline.get("schema_version", 0)
+    if baseline_version > SCHEMA_VERSION:
+        print(f"Error: Incompatible schema version {baseline_version}, expected {SCHEMA_VERSION}")
+        return 2
+
+    diff = generate_diff(baseline, latest, tolerance_pct, min_effect_ms)
+
+    print_diff(diff, baseline, latest)
+
+    save_diff(diff, output_path)
+    print(f"Diff written to {output_path}")
+
+    # Return exit code based on regressions
+    if diff["summary"]["regressions"] > 0:
+        print(f"\nExit code: 1 (regression detected)")
+        return 1
+
+    print(f"\nExit code: 0 (no regressions)")
+    return 0
+
+
+def save_baseline(latest_path: Path, baseline_path: Path) -> int:
+    """Copy latest to baseline."""
+    latest_json = latest_path.with_suffix(".json")
+
+    if not latest_json.exists():
+        print(f"Error: No results found at {latest_json}")
+        print("Run benchmarks first: uv run python bench/run_benchmarks.py")
+        return 2
+
+    baseline_json = baseline_path.with_suffix(".json")
+    shutil.copy(latest_json, baseline_json)
+    print(f"Saved {baseline_json}")
+    print("Don't forget to commit the new baseline!")
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Compare benchmark results with baseline")
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        default=RESULTS_DIR / "baseline",
+        help="Path to baseline (without extension)",
+    )
+    parser.add_argument(
+        "--latest",
+        type=Path,
+        default=RESULTS_DIR / "latest",
+        help="Path to latest (without extension)",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=RESULTS_DIR / "diff.json",
+        help="Path to output diff.json",
+    )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=DEFAULT_TOLERANCE_PCT,
+        help=f"Regression threshold percentage (default: {DEFAULT_TOLERANCE_PCT})",
+    )
+    parser.add_argument(
+        "--min-effect-ms",
+        type=float,
+        default=DEFAULT_MIN_EFFECT_MS,
+        help=f"Minimum effect in ms to consider (default: {DEFAULT_MIN_EFFECT_MS})",
+    )
+    parser.add_argument(
+        "--save-baseline",
+        action="store_true",
+        help="Save current results as new baseline",
+    )
+    args = parser.parse_args()
+
+    if args.save_baseline:
+        exit_code = save_baseline(args.latest, args.baseline)
+    else:
+        exit_code = compare_results(
+            args.baseline,
+            args.latest,
+            args.output,
+            args.tolerance,
+            args.min_effect_ms,
+        )
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
