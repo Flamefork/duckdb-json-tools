@@ -130,7 +130,6 @@ static unique_ptr<FunctionData> JsonFlattenBind(ClientContext &context, ScalarFu
 	if (UTF8CharacterCount(separator) != 1) {
 		throw BinderException("json_flatten separator must be a VARCHAR literal of length 1");
 	}
-	Function::EraseArgument(function, arguments, 1);
 	return make_uniq<JsonFlattenBindData>(std::move(separator));
 }
 
@@ -1150,19 +1149,30 @@ static unique_ptr<FunctionData> JsonGroupMergeBind(ClientContext &context, Aggre
 			throw InvalidInputException("json_group_merge: treat_null_values must be one of %s",
 			                            JsonGroupMergeNullOptionsText().c_str());
 		}
-		Function::EraseArgument(function, arguments, 1);
 	}
 	return make_uniq<JsonGroupMergeBindData>(treatment);
+}
+
+static constexpr idx_t kAggregatedInputCount = 1;
+
+static void JsonGroupMergeUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                 data_ptr_t state, idx_t count) {
+	AggregateFunction::UnaryUpdate<JsonGroupMergeState, string_t, JsonGroupMergeFunction>(
+	    inputs, aggr_input_data, kAggregatedInputCount, state, count);
+}
+
+static void JsonGroupMergeScatterUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
+                                        Vector &states, idx_t count) {
+	AggregateFunction::UnaryScatterUpdate<JsonGroupMergeState, string_t, JsonGroupMergeFunction>(
+	    inputs, aggr_input_data, kAggregatedInputCount, states, count);
 }
 
 static AggregateFunction CreateJsonGroupMergeAggregate(const LogicalType &input_type) {
 	AggregateFunction function(
 	    "json_group_merge", {input_type}, LogicalType::JSON(), AggregateFunction::StateSize<JsonGroupMergeState>,
-	    AggregateFunction::StateInitialize<JsonGroupMergeState, JsonGroupMergeFunction>,
-	    AggregateFunction::UnaryScatterUpdate<JsonGroupMergeState, string_t, JsonGroupMergeFunction>,
+	    AggregateFunction::StateInitialize<JsonGroupMergeState, JsonGroupMergeFunction>, JsonGroupMergeScatterUpdate,
 	    AggregateFunction::StateCombine<JsonGroupMergeState, JsonGroupMergeFunction>,
-	    AggregateFunction::StateFinalize<JsonGroupMergeState, string_t, JsonGroupMergeFunction>,
-	    AggregateFunction::UnaryUpdate<JsonGroupMergeState, string_t, JsonGroupMergeFunction>);
+	    AggregateFunction::StateFinalize<JsonGroupMergeState, string_t, JsonGroupMergeFunction>, JsonGroupMergeUpdate);
 	function.destructor = AggregateFunction::StateDestroy<JsonGroupMergeState, JsonGroupMergeFunction>;
 	function.order_dependent = AggregateOrderDependent::ORDER_DEPENDENT;
 	function.bind = JsonGroupMergeBind;
@@ -1555,6 +1565,9 @@ static unique_ptr<FunctionData> JsonExtractColumnsBind(ClientContext &context, S
 		column_names.push_back(std::move(column_name));
 		patterns.push_back(std::move(pattern_str));
 	}
+	if (column_names.empty()) {
+		throw BinderException("json_extract_columns: column patterns must not be empty");
+	}
 
 	children.reserve(column_names.size());
 	for (idx_t i = 0; i < column_names.size(); i++) {
@@ -1848,7 +1861,7 @@ static void FlattenIntoObject(yyjson_val *node, yyjson_mut_doc *out_doc, yyjson_
 		while ((key = yyjson_obj_iter_next(&iter))) {
 			auto child = yyjson_obj_iter_get_val(key);
 			auto previous_size = key_buffer.size();
-			if (previous_size != 0) {
+			if (depth > 0) {
 				key_buffer.append(separator);
 			}
 			auto key_str = duckdb_yyjson::yyjson_get_str(key);
@@ -1863,7 +1876,7 @@ static void FlattenIntoObject(yyjson_val *node, yyjson_mut_doc *out_doc, yyjson_
 		idx_t index = 0;
 		while ((child = yyjson_arr_iter_next(&iter))) {
 			auto previous_size = key_buffer.size();
-			if (previous_size != 0) {
+			if (depth > 0) {
 				key_buffer.append(separator);
 			}
 			AppendIndexToKeyBuffer(key_buffer, index);
