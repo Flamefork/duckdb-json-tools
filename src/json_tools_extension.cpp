@@ -203,25 +203,57 @@ struct JsonValue {
 	static JsonValue MakeArray(JsonArray arr);
 	static JsonValue MakeObject(JsonObject obj);
 
-	bool IsNull() const { return type == JsonValueType::JSON_NULL; }
-	bool IsObject() const { return type == JsonValueType::OBJECT_VAL; }
-	bool IsArray() const { return type == JsonValueType::ARRAY_VAL; }
-	bool IsString() const { return type == JsonValueType::STRING_VAL; }
-	bool IsBool() const { return type == JsonValueType::BOOL_VAL; }
-	bool IsInt64() const { return type == JsonValueType::INT64_VAL; }
-	bool IsUint64() const { return type == JsonValueType::UINT64_VAL; }
-	bool IsDouble() const { return type == JsonValueType::DOUBLE_VAL; }
-	bool IsUninitialized() const { return type == JsonValueType::UNINITIALIZED; }
+	bool IsNull() const {
+		return type == JsonValueType::JSON_NULL;
+	}
+	bool IsObject() const {
+		return type == JsonValueType::OBJECT_VAL;
+	}
+	bool IsArray() const {
+		return type == JsonValueType::ARRAY_VAL;
+	}
+	bool IsString() const {
+		return type == JsonValueType::STRING_VAL;
+	}
+	bool IsBool() const {
+		return type == JsonValueType::BOOL_VAL;
+	}
+	bool IsInt64() const {
+		return type == JsonValueType::INT64_VAL;
+	}
+	bool IsUint64() const {
+		return type == JsonValueType::UINT64_VAL;
+	}
+	bool IsDouble() const {
+		return type == JsonValueType::DOUBLE_VAL;
+	}
+	bool IsUninitialized() const {
+		return type == JsonValueType::UNINITIALIZED;
+	}
 
 	JsonObject &AsObject();
 	const JsonObject &AsObject() const;
-	JsonArray &AsArray() { return *array_ptr; }
-	const JsonArray &AsArray() const { return *array_ptr; }
-	const std::string &AsString() const { return string_val; }
-	bool AsBool() const { return primitive.bool_val; }
-	int64_t AsInt64() const { return primitive.int64_val; }
-	uint64_t AsUint64() const { return primitive.uint64_val; }
-	double AsDouble() const { return primitive.double_val; }
+	JsonArray &AsArray() {
+		return *array_ptr;
+	}
+	const JsonArray &AsArray() const {
+		return *array_ptr;
+	}
+	const std::string &AsString() const {
+		return string_val;
+	}
+	bool AsBool() const {
+		return primitive.bool_val;
+	}
+	int64_t AsInt64() const {
+		return primitive.int64_val;
+	}
+	uint64_t AsUint64() const {
+		return primitive.uint64_val;
+	}
+	double AsDouble() const {
+		return primitive.double_val;
+	}
 };
 
 // Insertion-order-preserving JSON object with O(1) key lookup
@@ -232,7 +264,8 @@ public:
 		JsonValue value;
 		bool deleted;
 
-		Entry(std::string k, JsonValue v) : key(std::move(k)), value(std::move(v)), deleted(false) {}
+		Entry(std::string k, JsonValue v) : key(std::move(k)), value(std::move(v)), deleted(false) {
+		}
 	};
 
 	JsonObject() = default;
@@ -242,8 +275,7 @@ public:
 		RebuildIndex();
 	}
 
-	JsonObject(JsonObject &&other) noexcept
-	    : entries_(std::move(other.entries_)), index_(std::move(other.index_)) {
+	JsonObject(JsonObject &&other) noexcept : entries_(std::move(other.entries_)), index_(std::move(other.index_)) {
 	}
 
 	JsonObject &operator=(const JsonObject &other) {
@@ -306,8 +338,12 @@ public:
 		index_.clear();
 	}
 
-	bool Empty() const { return index_.empty(); }
-	idx_t Size() const { return index_.size(); }
+	bool Empty() const {
+		return index_.empty();
+	}
+	idx_t Size() const {
+		return index_.size();
+	}
 
 	// Iterate over non-deleted entries (preserves insertion order)
 	class Iterator {
@@ -316,7 +352,9 @@ public:
 			SkipDeleted();
 		}
 
-		bool operator!=(const Iterator &other) const { return pos_ != other.pos_; }
+		bool operator!=(const Iterator &other) const {
+			return pos_ != other.pos_;
+		}
 
 		Iterator &operator++() {
 			++pos_;
@@ -345,7 +383,9 @@ public:
 			SkipDeleted();
 		}
 
-		bool operator!=(const ConstIterator &other) const { return pos_ != other.pos_; }
+		bool operator!=(const ConstIterator &other) const {
+			return pos_ != other.pos_;
+		}
 
 		ConstIterator &operator++() {
 			++pos_;
@@ -368,10 +408,18 @@ public:
 		idx_t pos_;
 	};
 
-	Iterator begin() { return Iterator(&entries_, 0); }
-	Iterator end() { return Iterator(&entries_, entries_.size()); }
-	ConstIterator begin() const { return ConstIterator(&entries_, 0); }
-	ConstIterator end() const { return ConstIterator(&entries_, entries_.size()); }
+	Iterator begin() {
+		return Iterator(&entries_, 0);
+	}
+	Iterator end() {
+		return Iterator(&entries_, entries_.size());
+	}
+	ConstIterator begin() const {
+		return ConstIterator(&entries_, 0);
+	}
+	ConstIterator end() const {
+		return ConstIterator(&entries_, entries_.size());
+	}
 
 private:
 	void RebuildIndex() {
@@ -388,7 +436,9 @@ private:
 };
 
 // JsonValue method implementations (after JsonObject is defined)
-inline JsonValue::JsonValue() : type(JsonValueType::UNINITIALIZED) { primitive.int64_val = 0; }
+inline JsonValue::JsonValue() : type(JsonValueType::UNINITIALIZED) {
+	primitive.int64_val = 0;
+}
 inline JsonValue::~JsonValue() = default;
 
 inline JsonValue::JsonValue(const JsonValue &other)
@@ -493,13 +543,17 @@ inline JsonValue JsonValue::MakeObject(JsonObject obj) {
 	return v;
 }
 
-inline JsonObject &JsonValue::AsObject() { return *object_ptr; }
-inline const JsonObject &JsonValue::AsObject() const { return *object_ptr; }
+inline JsonObject &JsonValue::AsObject() {
+	return *object_ptr;
+}
+inline const JsonObject &JsonValue::AsObject() const {
+	return *object_ptr;
+}
 
 struct JsonGroupMergeState {
 	JsonObject *result_map;
 	JsonObject *patch_map;
-	JsonValue *scalar_replacement;  // Set when a non-object patch replaces the entire result
+	JsonValue *scalar_replacement; // Set when a non-object patch replaces the entire result
 	bool result_has_input;
 	bool patch_has_input;
 	bool patch_has_nulls;
@@ -676,8 +730,8 @@ static yyjson_mut_val *BuildYyjsonValue(yyjson_mut_doc *doc, const JsonValue &va
 }
 
 // Apply patch to target map (result_map) - implements JSON merge patch semantics
-static void ApplyPatchToMap(JsonObject &target, yyjson_val *patch, idx_t depth,
-                            JsonNullTreatment null_treatment, bool *saw_nulls) {
+static void ApplyPatchToMap(JsonObject &target, yyjson_val *patch, idx_t depth, JsonNullTreatment null_treatment,
+                            bool *saw_nulls) {
 	if (!patch) {
 		return;
 	}
@@ -704,14 +758,14 @@ static void ApplyPatchToMap(JsonObject &target, yyjson_val *patch, idx_t depth,
 				*saw_nulls = true;
 			}
 			if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
-				target.Erase(key);  // O(1) average
+				target.Erase(key); // O(1) average
 			}
 			continue;
 		}
 
 		if (duckdb_yyjson::yyjson_is_obj(patch_val)) {
 			// Recursive merge for nested objects
-			auto existing = target.Find(key);  // O(1) average
+			auto existing = target.Find(key); // O(1) average
 			if (existing && existing->IsObject()) {
 				// Existing value is object - merge into it
 				ApplyPatchToMap(existing->AsObject(), patch_val, depth + 1, null_treatment, saw_nulls);
@@ -728,13 +782,12 @@ static void ApplyPatchToMap(JsonObject &target, yyjson_val *patch, idx_t depth,
 		}
 
 		// For all other types, replace directly
-		target[key] = ParseYyjsonValue(patch_val, depth + 1);  // O(1) average
+		target[key] = ParseYyjsonValue(patch_val, depth + 1); // O(1) average
 	}
 }
 
 // Compose patch into patch_map (for DELETE_NULLS mode) - preserves null markers
-static void ComposePatchToMap(JsonObject &target, yyjson_val *patch, idx_t depth,
-                              JsonNullTreatment null_treatment) {
+static void ComposePatchToMap(JsonObject &target, yyjson_val *patch, idx_t depth, JsonNullTreatment null_treatment) {
 	if (!patch) {
 		return;
 	}
@@ -780,8 +833,8 @@ static void ComposePatchToMap(JsonObject &target, yyjson_val *patch, idx_t depth
 }
 
 // Apply JsonObject patch to target map (for Combine)
-static void ApplyMapToMap(JsonObject &target, const JsonObject &source, idx_t depth,
-                          JsonNullTreatment null_treatment, bool *saw_nulls) {
+static void ApplyMapToMap(JsonObject &target, const JsonObject &source, idx_t depth, JsonNullTreatment null_treatment,
+                          bool *saw_nulls) {
 	if (depth > MAX_JSON_NESTING_DEPTH) {
 		throw InvalidInputException("json_group_merge: nesting depth exceeds maximum limit of " +
 		                            std::to_string(MAX_JSON_NESTING_DEPTH));
@@ -1011,8 +1064,8 @@ public:
 		if (!doc) {
 			throw InternalException("json_group_merge: failed to allocate output document");
 		}
-		std::unique_ptr<duckdb_yyjson::yyjson_mut_doc, decltype(&duckdb_yyjson::yyjson_mut_doc_free)>
-		    doc_ptr(doc, duckdb_yyjson::yyjson_mut_doc_free);
+		std::unique_ptr<duckdb_yyjson::yyjson_mut_doc, decltype(&duckdb_yyjson::yyjson_mut_doc_free)> doc_ptr(
+		    doc, duckdb_yyjson::yyjson_mut_doc_free);
 
 		duckdb_yyjson::yyjson_mut_val *root;
 
@@ -1041,8 +1094,8 @@ public:
 		duckdb_yyjson::yyjson_mut_doc_set_root(doc, root);
 
 		size_t output_length = 0;
-		auto output_cstr = duckdb_yyjson::yyjson_mut_write_opts(doc, JSONCommon::WRITE_FLAG, nullptr,
-		                                                        &output_length, nullptr);
+		auto output_cstr =
+		    duckdb_yyjson::yyjson_mut_write_opts(doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
 		if (!output_cstr) {
 			throw InternalException("json_group_merge: failed to serialize aggregate result");
 		}
@@ -1715,8 +1768,8 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 					local_state.match_results.clear();
 					pattern_set.Match(key_piece, &local_state.match_results);
 
-					match_chunks = chunked_cache.TryInsert(chunked_set_idx, key_str, key_len, key_hash,
-					                                       local_state.match_results);
+					match_chunks =
+					    chunked_cache.TryInsert(chunked_set_idx, key_str, key_len, key_hash, local_state.match_results);
 
 					// If cache insert failed, process directly from match_results
 					if (!match_chunks) {
