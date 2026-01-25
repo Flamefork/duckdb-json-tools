@@ -75,12 +75,22 @@ def diff_environment(baseline_env: dict | None, latest_env: dict | None) -> dict
     return diffs
 
 
+def format_multiplier(baseline_ms: float, current_ms: float) -> str:
+    """Format speed change as multiplier (e.g., '2.00× faster', '1.50× slower')."""
+    if current_ms > baseline_ms:
+        mult = current_ms / baseline_ms
+        return f"{mult:.2f}× slower"
+    else:
+        mult = baseline_ms / current_ms
+        return f"{mult:.2f}× faster"
+
+
 def get_top_cases(cases: list[dict], status: str, n: int = 3) -> list[dict]:
-    """Get top N cases by absolute diff_pct for given status."""
-    filtered = [c for c in cases if c["status"] == status and "diff_pct" in c]
-    sorted_cases = sorted(filtered, key=lambda c: abs(c["diff_pct"]), reverse=True)
+    """Get top N cases by multiplier magnitude for given status."""
+    filtered = [c for c in cases if c["status"] == status and "multiplier" in c]
+    sorted_cases = sorted(filtered, key=lambda c: c["multiplier"], reverse=True)
     return [
-        {"id": c["id"], "diff_pct": c["diff_pct"], "diff_ms": c["diff_ms"]}
+        {"id": c["id"], "multiplier": c["multiplier"], "multiplier_str": c["multiplier_str"]}
         for c in sorted_cases[:n]
     ]
 
@@ -123,9 +133,12 @@ def generate_diff(
             "current_ms": current_ms,
         }
 
-        if baseline_ms is not None and current_ms is not None:
-            case["diff_ms"] = round(current_ms - baseline_ms, 2)
-            case["diff_pct"] = round((current_ms - baseline_ms) / baseline_ms * 100, 2) if baseline_ms != 0 else 0
+        if baseline_ms is not None and current_ms is not None and baseline_ms != 0:
+            if current_ms > baseline_ms:
+                case["multiplier"] = round(current_ms / baseline_ms, 2)
+            else:
+                case["multiplier"] = round(baseline_ms / current_ms, 2)
+            case["multiplier_str"] = format_multiplier(baseline_ms, current_ms)
 
         cases.append(case)
 
@@ -134,10 +147,10 @@ def generate_diff(
     regressions = statuses.count("SLOWER")
     improvements = statuses.count("FASTER")
 
-    worst_regression = 0.0
+    worst_regression_mult = 1.0
     for c in cases:
-        if c["status"] == "SLOWER" and c.get("diff_pct", 0) > worst_regression:
-            worst_regression = c["diff_pct"]
+        if c["status"] == "SLOWER" and c.get("multiplier", 1.0) > worst_regression_mult:
+            worst_regression_mult = c["multiplier"]
 
     env_diff = diff_environment(baseline.get("environment"), latest.get("environment"))
 
@@ -156,7 +169,7 @@ def generate_diff(
             "unchanged": statuses.count("UNCHANGED"),
             "missing_in_baseline": statuses.count("MISSING_IN_BASELINE"),
             "missing_in_latest": statuses.count("MISSING_IN_LATEST"),
-            "worst_regression_pct": worst_regression,
+            "worst_regression_multiplier": worst_regression_mult,
             "top_regressions": get_top_cases(cases, "SLOWER", 3),
             "top_improvements": get_top_cases(cases, "FASTER", 3),
         },
@@ -178,43 +191,37 @@ def print_diff(diff: dict, baseline: dict, latest: dict) -> None:
             print(f"  - {key}: {val['baseline']} -> {val['current']}")
         print()
 
-    # Top regressions
-    top_reg = diff["summary"].get("top_regressions", [])
-    if top_reg:
-        print("Top regressions:")
-        for c in top_reg:
+    # Regressions (sorted by multiplier, most impactful first)
+    regressions = [c for c in diff["cases"] if c["status"] == "SLOWER"]
+    regressions.sort(key=lambda c: c.get("multiplier", 1.0), reverse=True)
+    if regressions:
+        print("Regressions:")
+        for c in regressions:
             profile_path = get_profile_path(c["id"])
             profile_str = f"  [profile: {profile_path}]" if profile_path else ""
-            print(f"  SLOWER   {c['id']:<45} +{c['diff_pct']:.1f}% (+{c['diff_ms']:.1f}ms){profile_str}")
+            print(f"  {c['id']:<50} {c['multiplier_str']}{profile_str}")
         print()
 
-    # Top improvements
-    top_imp = diff["summary"].get("top_improvements", [])
-    if top_imp:
-        print("Top improvements:")
-        for c in top_imp:
+    # Improvements (sorted by multiplier, most impactful first)
+    improvements = [c for c in diff["cases"] if c["status"] == "FASTER"]
+    improvements.sort(key=lambda c: c.get("multiplier", 1.0), reverse=True)
+    if improvements:
+        print("Improvements:")
+        for c in improvements:
             profile_path = get_profile_path(c["id"])
             profile_str = f"  [profile: {profile_path}]" if profile_path else ""
-            print(f"  FASTER   {c['id']:<45} {c['diff_pct']:.1f}% ({c['diff_ms']:.1f}ms){profile_str}")
+            print(f"  {c['id']:<50} {c['multiplier_str']}{profile_str}")
         print()
 
-    # Other notable changes (not in top-3)
-    top_ids = {c["id"] for c in top_reg + top_imp}
-    other_changes = [c for c in diff["cases"] if c["status"] in ("SLOWER", "FASTER", "MISSING_IN_BASELINE", "MISSING_IN_LATEST") and c["id"] not in top_ids]
-
-    if other_changes:
-        print("Other changes:")
-        for case in other_changes:
-            status = case["status"]
-            case_id = case["id"]
-            if status == "SLOWER":
-                print(f"  SLOWER   {case_id:<45} +{case['diff_pct']:.1f}% (+{case['diff_ms']:.1f}ms)")
-            elif status == "FASTER":
-                print(f"  FASTER   {case_id:<45} {case['diff_pct']:.1f}% ({case['diff_ms']:.1f}ms)")
-            elif status == "MISSING_IN_BASELINE":
-                print(f"  NEW      {case_id:<45} (not in baseline)")
-            elif status == "MISSING_IN_LATEST":
-                print(f"  REMOVED  {case_id:<45} (not in latest)")
+    # New/removed cases
+    new_cases = [c for c in diff["cases"] if c["status"] == "MISSING_IN_BASELINE"]
+    removed_cases = [c for c in diff["cases"] if c["status"] == "MISSING_IN_LATEST"]
+    if new_cases or removed_cases:
+        print("New/removed:")
+        for c in new_cases:
+            print(f"  {c['id']:<50} (new)")
+        for c in removed_cases:
+            print(f"  {c['id']:<50} (removed)")
         print()
 
     s = diff["summary"]

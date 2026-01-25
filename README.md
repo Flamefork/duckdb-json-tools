@@ -239,6 +239,16 @@ To run the SQL tests:
 make test
 ```
 
+### Running Benchmarks
+
+Performance benchmarks detect regressions. Run the full suite:
+
+```bash
+make release && uv run python bench/bench.py
+```
+
+See [bench/README.md](bench/README.md) and [bench/PROFILING.md](bench/PROFILING.md) for filtering, profiling, and baseline management.
+
 ## Contributing
 
 Contributions are welcome! Please:

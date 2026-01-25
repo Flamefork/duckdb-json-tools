@@ -8,11 +8,12 @@ PROJECT_ROOT = BENCH_DIR.parent
 EXTENSION_PATH = PROJECT_ROOT / "build" / "release" / "extension" / "json_tools" / "json_tools.duckdb_extension"
 
 SIZES = {
+    "1k": 1_000,
     "10k": 10_000,
     "100k": 100_000,
 }
 
-DEFAULT_RUNS = 5
+DEFAULT_RUNS = 10
 DEFAULT_PROFILE_RUNS = 1
 DEFAULT_TOLERANCE_PCT = 5
 SCHEMA_VERSION = 2
@@ -51,10 +52,45 @@ SPECIAL_KEY_PROB = 0.02
 SCENARIOS = [
     {"function": "json_flatten", "scenario": "basic"},
     {"function": "json_add_prefix", "scenario": "basic"},
-    {"function": "json_extract_columns", "scenario": "few_patterns"},
-    {"function": "json_extract_columns", "scenario": "many_patterns"},
-    {"function": "json_group_merge", "scenario": "few_groups"},     # g1e1, 10 groups
-    {"function": "json_group_merge", "scenario": "medium_groups"},  # g1e3, 1000 groups
-    {"function": "json_group_merge", "scenario": "many_groups"},    # g1e4, 10000 groups
-    {"function": "json_group_merge", "scenario": "ignore_nulls"},   # g1e3 with IGNORE NULLS
+    {
+        # 5 patterns: 2 exact, 2 prefix, 1 suffix
+        "function": "json_extract_columns",
+        "scenario": "few_patterns",
+        "patterns": {
+            "s1": "^s1$",           # exact
+            "s2": "^s2$",           # exact
+            "all_strings": "^s",    # prefix
+            "all_numbers": "^n",    # prefix
+            "counts": r"_count$",   # suffix (fallback)
+        },
+    },
+    {
+        # 14 patterns: 5 exact, 4 prefix, 5 regex/suffix
+        "function": "json_extract_columns",
+        "scenario": "medium_patterns",
+        "patterns": {
+            **{f"exact_s{i}": f"^s{i}$" for i in range(1, 6)},   # 5 exact
+            **{f"prefix_{c}": f"^{c}" for c in ["n", "o", "g", "a"]},  # 4 prefix
+            "nested_s": r"o1\.s\d+",   # regex
+            "nested_n": r"o1\.n\d+",   # regex
+            "any_nested": r"\.\w+$",   # regex
+            "ids": r"_id$",            # suffix
+            "counts": r"_count$",      # suffix
+        },
+    },
+    {
+        # 100 patterns: 40 exact, 30 prefix, 30 regex
+        "function": "json_extract_columns",
+        "scenario": "many_patterns",
+        "patterns": {
+            **{f"exact_{i:02d}": f"^s{i}$" for i in range(1, 41)},      # 40 exact
+            **{f"prefix_{i:02d}": f"^p{i:02d}" for i in range(1, 31)},  # 30 prefix
+            **{f"regex_{i:02d}": f"r{i:02d}.*" for i in range(1, 31)},  # 30 regex
+        },
+    },
+    {"function": "json_group_merge", "scenario": "few_groups", "group_col": "g1e1", "merge_opts": ""},
+    {"function": "json_group_merge", "scenario": "medium_groups", "group_col": "g1e3", "merge_opts": ""},
+    {"function": "json_group_merge", "scenario": "many_groups", "group_col": "g1e4", "merge_opts": ""},
+    {"function": "json_group_merge", "scenario": "ignore_nulls", "group_col": "g1e3", "merge_opts": ", 'IGNORE NULLS'"},
+    {"function": "json_group_merge", "scenario": "delete_nulls", "group_col": "g1e3", "merge_opts": ", 'DELETE NULLS'"},
 ]
