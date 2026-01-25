@@ -36,6 +36,38 @@ FROM (VALUES ('{"flag":true}'::json, 1), ('{"flag":false}'::json, 2)) AS t(patch
 {"flag":false}
 
 # ========================================
+# Empty Key Handling
+# ========================================
+
+# Empty string is a valid JSON key
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"":1}'::json, 1), ('{"a":2}'::json, 2)) AS t(patch, ts);
+----
+{"":1,"a":2}
+
+# Empty key with nested object
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"outer":{"":42}}'::json, 1)) AS t(patch, ts);
+----
+{"outer":{"":42}}
+
+# Empty key update
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"":1}'::json, 1), ('{"":2}'::json, 2)) AS t(patch, ts);
+----
+{"":2}
+
+# Empty key deletion with DELETE NULLS
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"":1,"keep":2}'::json, 1), ('{"":null}'::json, 2)) AS t(patch, ts);
+----
+{"keep":2}
+
+# ========================================
 # NULL Handling
 # ========================================
 
@@ -300,6 +332,36 @@ ORDER BY grp;
 5	{}	{}
 6	{}	{}
 7	{}	{}
+
+query III
+WITH patches AS (
+    SELECT
+        g AS grp,
+        ts,
+        CASE
+            WHEN ts = 0 THEN '{"a":{"b":1}}'::JSON
+            WHEN ts = 9999 THEN '{"a":{"b":null}}'::JSON
+            ELSE '{}'::JSON
+        END AS patch
+    FROM range(0, 8) g(g)
+    CROSS JOIN range(0, 10000) t(ts)
+)
+SELECT
+    grp,
+    json_group_merge(patch ORDER BY ts) AS agg,
+    list_reduce(list(patch ORDER BY ts), (acc, p) -> json_merge_patch(acc, p), '{}'::JSON) AS baseline
+FROM patches
+GROUP BY grp
+ORDER BY grp;
+----
+0	{"a":{}}	{"a":{}}
+1	{"a":{}}	{"a":{}}
+2	{"a":{}}	{"a":{}}
+3	{"a":{}}	{"a":{}}
+4	{"a":{}}	{"a":{}}
+5	{"a":{}}	{"a":{}}
+6	{"a":{}}	{"a":{}}
+7	{"a":{}}	{"a":{}}
 
 query II
 WITH patches AS (

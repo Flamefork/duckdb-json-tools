@@ -1,2 +1,3 @@
-*.duckdb
-results/
+data/*.parquet
+__pycache__/
+.venv/
