@@ -383,8 +383,6 @@ static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyj
 		if (duckdb_yyjson::yyjson_is_obj(patch_val)) {
 			auto merged_child = JsonGroupMergeApplyPatchInternal(doc, existing_child, patch_val, depth + 1,
 			                                                     replacements_since_compact, null_treatment);
-			// Skip if merged_child is null (can happen with IGNORE_NULLS when patch contains only nulls
-			// and there's no existing value)
 			if (!merged_child) {
 				continue;
 			}
@@ -601,7 +599,11 @@ public:
 		}
 		auto null_treatment = GetNullTreatment(unary_input.input.bind_data);
 		JsonGroupMergeApplyResultPatch(state, patch_root, null_treatment);
-		JsonGroupMergeComposePatch(state, patch_root, null_treatment);
+		// For IGNORE_NULLS mode, result_doc == patch_doc semantically, so skip building patch_doc.
+		// patch_doc is only needed in Combine() for DELETE_NULLS mode to replay deletions.
+		if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
+			JsonGroupMergeComposePatch(state, patch_root, null_treatment);
+		}
 	}
 
 	template <class INPUT_TYPE, class STATE, class OP>
@@ -614,20 +616,39 @@ public:
 
 	template <class STATE, class OP>
 	static void Combine(const STATE &source, STATE &target, AggregateInputData &aggr_input_data) {
-		if (!source.patch_has_input || !source.patch_doc || !source.patch_doc->root) {
+		auto null_treatment = GetNullTreatment(aggr_input_data.bind_data);
+
+		// For IGNORE_NULLS: use result_doc directly (semantically identical to patch_doc)
+		// For DELETE_NULLS: use patch_doc which preserves explicit null markers for replay
+		yyjson_mut_doc *source_doc = nullptr;
+		bool source_has_input = false;
+
+		if (null_treatment == JsonNullTreatment::IGNORE_NULLS) {
+			source_doc = source.result_doc;
+			source_has_input = source.result_has_input;
+		} else {
+			source_doc = source.patch_doc;
+			source_has_input = source.patch_has_input;
+		}
+
+		if (!source_has_input || !source_doc || !source_doc->root) {
 			return;
 		}
-		auto source_patch_doc_ptr = yyjson_doc_ptr(yyjson_mut_val_imut_copy(source.patch_doc->root, nullptr));
-		if (!source_patch_doc_ptr) {
-			throw InternalException("json_group_merge: failed to materialize patch state");
+
+		auto source_doc_ptr = yyjson_doc_ptr(yyjson_mut_val_imut_copy(source_doc->root, nullptr));
+		if (!source_doc_ptr) {
+			throw InternalException("json_group_merge: failed to materialize source state");
 		}
-		auto patch_root = yyjson_doc_get_root(source_patch_doc_ptr.get());
+		auto patch_root = yyjson_doc_get_root(source_doc_ptr.get());
 		if (!patch_root) {
-			throw InternalException("json_group_merge: failed to materialize patch state");
+			throw InternalException("json_group_merge: failed to materialize source state");
 		}
-		auto null_treatment = GetNullTreatment(aggr_input_data.bind_data);
+
 		JsonGroupMergeApplyResultPatch(target, patch_root, null_treatment);
-		JsonGroupMergeComposePatch(target, patch_root, null_treatment);
+		// For DELETE_NULLS, also update target's patch_doc for further combines
+		if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
+			JsonGroupMergeComposePatch(target, patch_root, null_treatment);
+		}
 	}
 
 	template <class RESULT_TYPE, class STATE>
