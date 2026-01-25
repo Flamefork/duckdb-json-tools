@@ -301,6 +301,36 @@ ORDER BY grp;
 6	{}	{}
 7	{}	{}
 
+query III
+WITH patches AS (
+    SELECT
+        g AS grp,
+        ts,
+        CASE
+            WHEN ts = 0 THEN '{"a":{"b":1}}'::JSON
+            WHEN ts = 9999 THEN '{"a":{"b":null}}'::JSON
+            ELSE '{}'::JSON
+        END AS patch
+    FROM range(0, 8) g(g)
+    CROSS JOIN range(0, 10000) t(ts)
+)
+SELECT
+    grp,
+    json_group_merge(patch ORDER BY ts) AS agg,
+    list_reduce(list(patch ORDER BY ts), (acc, p) -> json_merge_patch(acc, p), '{}'::JSON) AS baseline
+FROM patches
+GROUP BY grp
+ORDER BY grp;
+----
+0	{"a":{}}	{"a":{}}
+1	{"a":{}}	{"a":{}}
+2	{"a":{}}	{"a":{}}
+3	{"a":{}}	{"a":{}}
+4	{"a":{}}	{"a":{}}
+5	{"a":{}}	{"a":{}}
+6	{"a":{}}	{"a":{}}
+7	{"a":{}}	{"a":{}}
+
 query II
 WITH patches AS (
     SELECT

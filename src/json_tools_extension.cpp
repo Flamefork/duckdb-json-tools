@@ -152,6 +152,7 @@ struct JsonGroupMergeState {
 	yyjson_mut_doc *patch_doc;
 	bool result_has_input;
 	bool patch_has_input;
+	bool patch_has_nulls;
 	idx_t result_replacements_since_compact;
 	idx_t patch_replacements_since_compact;
 };
@@ -215,6 +216,7 @@ static void JsonGroupMergeStateInit(JsonGroupMergeState &state) {
 	yyjson_mut_doc_set_root(state.patch_doc, patch_root);
 	state.result_has_input = false;
 	state.patch_has_input = false;
+	state.patch_has_nulls = false;
 	state.result_replacements_since_compact = 0;
 	state.patch_replacements_since_compact = 0;
 }
@@ -230,6 +232,7 @@ static void JsonGroupMergeStateDestroy(JsonGroupMergeState &state) {
 	}
 	state.result_has_input = false;
 	state.patch_has_input = false;
+	state.patch_has_nulls = false;
 	state.result_replacements_since_compact = 0;
 	state.patch_replacements_since_compact = 0;
 }
@@ -240,7 +243,7 @@ constexpr idx_t MAX_JSON_NESTING_DEPTH = 1000;
 
 static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
                                                         idx_t depth, idx_t &replacements_since_compact,
-                                                        JsonNullTreatment null_treatment);
+                                                        JsonNullTreatment null_treatment, bool *saw_nulls);
 
 static void JsonGroupMergeCompactDoc(yyjson_mut_doc *&doc) {
 	if (!doc || !doc->root) {
@@ -260,6 +263,41 @@ static void JsonGroupMergeCompactDoc(yyjson_mut_doc *&doc) {
 	doc = new_doc;
 }
 
+static void JsonGroupMergeResetPatchDocFromResult(JsonGroupMergeState &state) {
+	if (!state.result_doc || !state.result_doc->root) {
+		yyjson_mut_doc_free(state.patch_doc);
+		state.patch_doc = yyjson_mut_doc_new(nullptr);
+		if (!state.patch_doc) {
+			throw InternalException("json_group_merge: failed to allocate aggregate state");
+		}
+		auto patch_root = yyjson_mut_obj(state.patch_doc);
+		if (!patch_root) {
+			yyjson_mut_doc_free(state.patch_doc);
+			state.patch_doc = nullptr;
+			throw InternalException("json_group_merge: failed to allocate initial JSON object");
+		}
+		yyjson_mut_doc_set_root(state.patch_doc, patch_root);
+		state.patch_has_input = false;
+		state.patch_replacements_since_compact = 0;
+		return;
+	}
+
+	auto new_doc = yyjson_mut_doc_new(nullptr);
+	if (!new_doc) {
+		throw InternalException("json_group_merge: failed to allocate aggregate state");
+	}
+	auto root_copy = yyjson_mut_val_mut_copy(new_doc, state.result_doc->root);
+	if (!root_copy) {
+		yyjson_mut_doc_free(new_doc);
+		throw InternalException("json_group_merge: failed to copy aggregate state");
+	}
+	yyjson_mut_doc_set_root(new_doc, root_copy);
+	yyjson_mut_doc_free(state.patch_doc);
+	state.patch_doc = new_doc;
+	state.patch_has_input = state.result_has_input;
+	state.patch_replacements_since_compact = 0;
+}
+
 static void JsonGroupMergeMaybeCompact(JsonGroupMergeState &state) {
 	if (state.result_replacements_since_compact >= JSON_GROUP_MERGE_COMPACT_THRESHOLD) {
 		JsonGroupMergeCompactDoc(state.result_doc);
@@ -271,14 +309,18 @@ static void JsonGroupMergeMaybeCompact(JsonGroupMergeState &state) {
 	}
 }
 
-static void JsonGroupMergeApplyResultPatch(JsonGroupMergeState &state, yyjson_val *patch_root,
-                                           JsonNullTreatment null_treatment) {
+static bool JsonGroupMergeApplyResultPatch(JsonGroupMergeState &state, yyjson_val *patch_root,
+                                           JsonNullTreatment null_treatment, bool *saw_nulls) {
 	if (!patch_root) {
 		throw InvalidInputException("json_group_merge: invalid JSON payload");
 	}
+	if (saw_nulls) {
+		*saw_nulls = false;
+	}
 	auto base_root = state.result_has_input ? state.result_doc->root : nullptr;
 	auto merged_root = JsonGroupMergeApplyPatchInternal(state.result_doc, base_root, patch_root, 0,
-	                                                    state.result_replacements_since_compact, null_treatment);
+	                                                    state.result_replacements_since_compact, null_treatment,
+	                                                    saw_nulls);
 	if (!merged_root) {
 		throw InternalException("json_group_merge: failed to merge JSON documents");
 	}
@@ -287,6 +329,7 @@ static void JsonGroupMergeApplyResultPatch(JsonGroupMergeState &state, yyjson_va
 	}
 	state.result_has_input = true;
 	JsonGroupMergeMaybeCompact(state);
+	return saw_nulls ? *saw_nulls : false;
 }
 
 static yyjson_mut_val *JsonGroupMergeComposePatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
@@ -313,7 +356,7 @@ static void JsonGroupMergeComposePatch(JsonGroupMergeState &state, yyjson_val *p
 
 static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
                                                         idx_t depth, idx_t &replacements_since_compact,
-                                                        JsonNullTreatment null_treatment) {
+                                                        JsonNullTreatment null_treatment, bool *saw_nulls) {
 	if (!patch) {
 		return base;
 	}
@@ -367,6 +410,9 @@ static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyj
 		}
 
 		if (duckdb_yyjson::yyjson_is_null(patch_val)) {
+			if (saw_nulls) {
+				*saw_nulls = true;
+			}
 			if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
 				if (result) {
 					auto removed = duckdb_yyjson::yyjson_mut_obj_remove_keyn(result, key_str, key_len);
@@ -379,10 +425,10 @@ static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyj
 			continue;
 		}
 
-		auto existing_child = result ? duckdb_yyjson::yyjson_mut_obj_getn(result, key_str, key_len) : nullptr;
 		if (duckdb_yyjson::yyjson_is_obj(patch_val)) {
+			auto existing_child = result ? duckdb_yyjson::yyjson_mut_obj_getn(result, key_str, key_len) : nullptr;
 			auto merged_child = JsonGroupMergeApplyPatchInternal(doc, existing_child, patch_val, depth + 1,
-			                                                     replacements_since_compact, null_treatment);
+			                                                     replacements_since_compact, null_treatment, saw_nulls);
 			if (!merged_child) {
 				continue;
 			}
@@ -408,11 +454,11 @@ static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyj
 		if (!new_child) {
 			throw InternalException("json_group_merge: failed to copy JSON value");
 		}
-		if (existing_child) {
-			replacements_since_compact++;
-			duckdb_yyjson::yyjson_mut_obj_remove_keyn(result, key_str, key_len);
-		}
 		auto target_obj = EnsureResult();
+		auto removed = duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
+		if (removed) {
+			replacements_since_compact++;
+		}
 		auto key_copy = yyjson_mut_strncpy(doc, key_str, key_len);
 		if (!key_copy) {
 			throw InternalException("json_group_merge: failed to allocate key storage");
@@ -514,8 +560,8 @@ static yyjson_mut_val *JsonGroupMergeComposePatchInternal(yyjson_mut_doc *doc, y
 			continue;
 		}
 
-		auto existing_child = result ? duckdb_yyjson::yyjson_mut_obj_getn(result, key_str, key_len) : nullptr;
 		if (duckdb_yyjson::yyjson_is_obj(patch_val)) {
+			auto existing_child = result ? duckdb_yyjson::yyjson_mut_obj_getn(result, key_str, key_len) : nullptr;
 			auto merged_child = JsonGroupMergeComposePatchInternal(doc, existing_child, patch_val, depth + 1,
 			                                                       replacements_since_compact, null_treatment);
 			if (!merged_child) {
@@ -544,9 +590,9 @@ static yyjson_mut_val *JsonGroupMergeComposePatchInternal(yyjson_mut_doc *doc, y
 			throw InternalException("json_group_merge: failed to copy JSON value");
 		}
 		auto target_obj = EnsureResult();
-		if (existing_child) {
+		auto removed = duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
+		if (removed) {
 			replacements_since_compact++;
-			duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
 		}
 		auto key_copy = yyjson_mut_strncpy(doc, key_str, key_len);
 		if (!key_copy) {
@@ -598,11 +644,18 @@ public:
 			throw InvalidInputException("json_group_merge: invalid JSON payload");
 		}
 		auto null_treatment = GetNullTreatment(unary_input.input.bind_data);
-		JsonGroupMergeApplyResultPatch(state, patch_root, null_treatment);
+		bool saw_nulls = false;
+		JsonGroupMergeApplyResultPatch(state, patch_root, null_treatment, &saw_nulls);
 		// For IGNORE_NULLS mode, result_doc == patch_doc semantically, so skip building patch_doc.
 		// patch_doc is only needed in Combine() for DELETE_NULLS mode to replay deletions.
 		if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
-			JsonGroupMergeComposePatch(state, patch_root, null_treatment);
+			if (state.patch_has_nulls || saw_nulls) {
+				if (!state.patch_has_nulls) {
+					JsonGroupMergeResetPatchDocFromResult(state);
+					state.patch_has_nulls = true;
+				}
+				JsonGroupMergeComposePatch(state, patch_root, null_treatment);
+			}
 		}
 	}
 
@@ -623,7 +676,7 @@ public:
 		yyjson_mut_doc *source_doc = nullptr;
 		bool source_has_input = false;
 
-		if (null_treatment == JsonNullTreatment::IGNORE_NULLS) {
+		if (null_treatment == JsonNullTreatment::IGNORE_NULLS || !source.patch_has_nulls) {
 			source_doc = source.result_doc;
 			source_has_input = source.result_has_input;
 		} else {
@@ -644,10 +697,17 @@ public:
 			throw InternalException("json_group_merge: failed to materialize source state");
 		}
 
-		JsonGroupMergeApplyResultPatch(target, patch_root, null_treatment);
-		// For DELETE_NULLS, also update target's patch_doc for further combines
+		bool saw_nulls = false;
+		JsonGroupMergeApplyResultPatch(target, patch_root, null_treatment, &saw_nulls);
+		// For DELETE_NULLS, update target's patch_doc for further combines when needed
 		if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
-			JsonGroupMergeComposePatch(target, patch_root, null_treatment);
+			if (target.patch_has_nulls || saw_nulls) {
+				if (!target.patch_has_nulls) {
+					JsonGroupMergeResetPatchDocFromResult(target);
+					target.patch_has_nulls = true;
+				}
+				JsonGroupMergeComposePatch(target, patch_root, null_treatment);
+			}
 		}
 	}
 
