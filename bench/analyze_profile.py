@@ -2,7 +2,7 @@
 """Analyze samply profiles programmatically.
 
 Usage:
-    python bench/scripts/analyze_profile.py bench/results/samply/<case>.json.gz [--thread <name>]
+    python bench/analyze_profile.py bench/results/samply/<case>.json.gz [--thread <name>]
 
 Requires --unstable-presymbolicate when recording:
     samply record --save-only --unstable-presymbolicate --output <file>.json.gz -- <command>
@@ -107,7 +107,7 @@ def analyze_thread(thread: dict, lib_symbols: dict, lib_debug_names: dict) -> tu
     return dict(self_samples), dict(inclusive_samples)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze samply profiles")
     parser.add_argument("profile", type=Path, help="Path to profile.json.gz")
     parser.add_argument("--thread", default=None, help="Thread name to analyze (default: largest)")
@@ -119,7 +119,7 @@ def main():
     if not syms_path.exists():
         print(f"Error: syms file not found: {syms_path}")
         print("Re-record with --unstable-presymbolicate")
-        return 1
+        raise SystemExit(2)
 
     profile = load_profile(args.profile)
     syms = load_symbols(syms_path)
@@ -140,7 +140,7 @@ def main():
         thread = next((t for t in threads if t.get("name") == args.thread), None)
         if not thread:
             print(f"Error: thread '{args.thread}' not found")
-            return 1
+            raise SystemExit(2)
     else:
         thread = max(threads, key=lambda t: len(t.get("samples", {}).get("stack", [])))
     print(f"\nAnalyzing thread: {thread.get('name')}")
@@ -174,4 +174,4 @@ def main():
 
 
 if __name__ == "__main__":
-    exit(main() or 0)
+    main()

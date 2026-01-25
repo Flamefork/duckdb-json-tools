@@ -69,13 +69,13 @@ symbolization.
 
 ## Analyzing profiles programmatically
 
-Use `bench/scripts/analyze_profile.py` to extract function timings from profiles.
+Use `bench/analyze_profile.py` to extract function timings from profiles.
 Requires `--unstable-presymbolicate` when recording to generate the `.syms.json` sidecar.
 
 ### Basic usage
 
 ```bash
-python3 bench/scripts/analyze_profile.py bench/results/samply/<case>.json.gz
+python3 bench/analyze_profile.py bench/results/samply/<case>.json.gz
 ```
 
 ### Options
@@ -90,16 +90,16 @@ python3 bench/scripts/analyze_profile.py bench/results/samply/<case>.json.gz
 
 ```bash
 # Basic analysis - shows all threads, then top functions by self/inclusive time
-python3 bench/scripts/analyze_profile.py bench/results/samply/json_group_merge.json.gz
+python3 bench/analyze_profile.py bench/results/samply/json_group_merge.json.gz
 
 # Filter for json-related functions only
-python3 bench/scripts/analyze_profile.py <profile> --filter json --top 20
+python3 bench/analyze_profile.py <profile> --filter json --top 20
 
 # Analyze a specific thread (useful when multiple workers)
-python3 bench/scripts/analyze_profile.py <profile> --thread python3
+python3 bench/analyze_profile.py <profile> --thread python3
 
 # Show more results
-python3 bench/scripts/analyze_profile.py <profile> --top 50
+python3 bench/analyze_profile.py <profile> --top 50
 ```
 
 ### Output format
