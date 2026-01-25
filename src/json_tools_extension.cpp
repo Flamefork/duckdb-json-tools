@@ -31,6 +31,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace duckdb {
@@ -147,14 +148,361 @@ static unique_ptr<FunctionLocalState> JsonAddPrefixInitLocalState(ExpressionStat
 	return make_uniq<JsonAddPrefixLocalState>(BufferAllocator::Get(context));
 }
 
+// Hash map based JSON value representation for O(1) key operations
+struct JsonValue;
+using JsonArray = std::vector<JsonValue>;
+
+enum class JsonValueType : uint8_t {
+	UNINITIALIZED = 0,
+	JSON_NULL,
+	BOOL_VAL,
+	INT64_VAL,
+	UINT64_VAL,
+	DOUBLE_VAL,
+	STRING_VAL,
+	ARRAY_VAL,
+	OBJECT_VAL
+};
+
+// Forward declare JsonObject (defined after JsonValue)
+class JsonObject;
+
+struct JsonValue {
+	JsonValueType type;
+	union {
+		bool bool_val;
+		int64_t int64_val;
+		uint64_t uint64_val;
+		double double_val;
+	} primitive;
+	std::string string_val;
+	unique_ptr<JsonArray> array_ptr;
+	unique_ptr<JsonObject> object_ptr;
+
+	JsonValue();
+	~JsonValue();
+
+	// Copy constructor - deep copy
+	JsonValue(const JsonValue &other);
+
+	// Move constructor
+	JsonValue(JsonValue &&other) noexcept;
+
+	// Copy assignment - deep copy
+	JsonValue &operator=(const JsonValue &other);
+
+	// Move assignment
+	JsonValue &operator=(JsonValue &&other) noexcept;
+
+	static JsonValue MakeNull();
+	static JsonValue MakeBool(bool b);
+	static JsonValue MakeInt64(int64_t n);
+	static JsonValue MakeUint64(uint64_t n);
+	static JsonValue MakeDouble(double d);
+	static JsonValue MakeString(std::string s);
+	static JsonValue MakeArray(JsonArray arr);
+	static JsonValue MakeObject(JsonObject obj);
+
+	bool IsNull() const { return type == JsonValueType::JSON_NULL; }
+	bool IsObject() const { return type == JsonValueType::OBJECT_VAL; }
+	bool IsArray() const { return type == JsonValueType::ARRAY_VAL; }
+	bool IsString() const { return type == JsonValueType::STRING_VAL; }
+	bool IsBool() const { return type == JsonValueType::BOOL_VAL; }
+	bool IsInt64() const { return type == JsonValueType::INT64_VAL; }
+	bool IsUint64() const { return type == JsonValueType::UINT64_VAL; }
+	bool IsDouble() const { return type == JsonValueType::DOUBLE_VAL; }
+	bool IsUninitialized() const { return type == JsonValueType::UNINITIALIZED; }
+
+	JsonObject &AsObject();
+	const JsonObject &AsObject() const;
+	JsonArray &AsArray() { return *array_ptr; }
+	const JsonArray &AsArray() const { return *array_ptr; }
+	const std::string &AsString() const { return string_val; }
+	bool AsBool() const { return primitive.bool_val; }
+	int64_t AsInt64() const { return primitive.int64_val; }
+	uint64_t AsUint64() const { return primitive.uint64_val; }
+	double AsDouble() const { return primitive.double_val; }
+};
+
+// Insertion-order-preserving JSON object with O(1) key lookup
+class JsonObject {
+public:
+	struct Entry {
+		std::string key;
+		JsonValue value;
+		bool deleted;
+
+		Entry(std::string k, JsonValue v) : key(std::move(k)), value(std::move(v)), deleted(false) {}
+	};
+
+	JsonObject() = default;
+	~JsonObject() = default;
+
+	JsonObject(const JsonObject &other) : entries_(other.entries_) {
+		RebuildIndex();
+	}
+
+	JsonObject(JsonObject &&other) noexcept
+	    : entries_(std::move(other.entries_)), index_(std::move(other.index_)) {
+	}
+
+	JsonObject &operator=(const JsonObject &other) {
+		if (this != &other) {
+			entries_ = other.entries_;
+			RebuildIndex();
+		}
+		return *this;
+	}
+
+	JsonObject &operator=(JsonObject &&other) noexcept {
+		if (this != &other) {
+			entries_ = std::move(other.entries_);
+			index_ = std::move(other.index_);
+		}
+		return *this;
+	}
+
+	// O(1) amortized lookup
+	JsonValue *Find(const std::string &key) {
+		auto it = index_.find(key);
+		if (it == index_.end()) {
+			return nullptr;
+		}
+		return &entries_[it->second].value;
+	}
+
+	const JsonValue *Find(const std::string &key) const {
+		auto it = index_.find(key);
+		if (it == index_.end()) {
+			return nullptr;
+		}
+		return &entries_[it->second].value;
+	}
+
+	// O(1) amortized insert or update
+	JsonValue &operator[](const std::string &key) {
+		auto it = index_.find(key);
+		if (it != index_.end()) {
+			return entries_[it->second].value;
+		}
+		idx_t new_idx = entries_.size();
+		entries_.emplace_back(key, JsonValue());
+		index_[key] = new_idx;
+		return entries_.back().value;
+	}
+
+	// O(1) erase (marks as deleted, doesn't shift)
+	void Erase(const std::string &key) {
+		auto it = index_.find(key);
+		if (it != index_.end()) {
+			idx_t idx = it->second;
+			entries_[idx].deleted = true;
+			index_.erase(it);
+		}
+	}
+
+	void Clear() {
+		entries_.clear();
+		index_.clear();
+	}
+
+	bool Empty() const { return index_.empty(); }
+	idx_t Size() const { return index_.size(); }
+
+	// Iterate over non-deleted entries (preserves insertion order)
+	class Iterator {
+	public:
+		Iterator(std::vector<Entry> *entries, idx_t pos) : entries_(entries), pos_(pos) {
+			SkipDeleted();
+		}
+
+		bool operator!=(const Iterator &other) const { return pos_ != other.pos_; }
+
+		Iterator &operator++() {
+			++pos_;
+			SkipDeleted();
+			return *this;
+		}
+
+		std::pair<const std::string &, JsonValue &> operator*() const {
+			return {(*entries_)[pos_].key, (*entries_)[pos_].value};
+		}
+
+	private:
+		void SkipDeleted() {
+			while (pos_ < entries_->size() && (*entries_)[pos_].deleted) {
+				++pos_;
+			}
+		}
+
+		std::vector<Entry> *entries_;
+		idx_t pos_;
+	};
+
+	class ConstIterator {
+	public:
+		ConstIterator(const std::vector<Entry> *entries, idx_t pos) : entries_(entries), pos_(pos) {
+			SkipDeleted();
+		}
+
+		bool operator!=(const ConstIterator &other) const { return pos_ != other.pos_; }
+
+		ConstIterator &operator++() {
+			++pos_;
+			SkipDeleted();
+			return *this;
+		}
+
+		std::pair<const std::string &, const JsonValue &> operator*() const {
+			return {(*entries_)[pos_].key, (*entries_)[pos_].value};
+		}
+
+	private:
+		void SkipDeleted() {
+			while (pos_ < entries_->size() && (*entries_)[pos_].deleted) {
+				++pos_;
+			}
+		}
+
+		const std::vector<Entry> *entries_;
+		idx_t pos_;
+	};
+
+	Iterator begin() { return Iterator(&entries_, 0); }
+	Iterator end() { return Iterator(&entries_, entries_.size()); }
+	ConstIterator begin() const { return ConstIterator(&entries_, 0); }
+	ConstIterator end() const { return ConstIterator(&entries_, entries_.size()); }
+
+private:
+	void RebuildIndex() {
+		index_.clear();
+		for (idx_t i = 0; i < entries_.size(); ++i) {
+			if (!entries_[i].deleted) {
+				index_[entries_[i].key] = i;
+			}
+		}
+	}
+
+	std::vector<Entry> entries_;
+	std::unordered_map<std::string, idx_t> index_;
+};
+
+// JsonValue method implementations (after JsonObject is defined)
+inline JsonValue::JsonValue() : type(JsonValueType::UNINITIALIZED) { primitive.int64_val = 0; }
+inline JsonValue::~JsonValue() = default;
+
+inline JsonValue::JsonValue(const JsonValue &other)
+    : type(other.type), primitive(other.primitive), string_val(other.string_val) {
+	if (other.array_ptr) {
+		array_ptr = make_uniq<JsonArray>(*other.array_ptr);
+	}
+	if (other.object_ptr) {
+		object_ptr = make_uniq<JsonObject>(*other.object_ptr);
+	}
+}
+
+inline JsonValue::JsonValue(JsonValue &&other) noexcept
+    : type(other.type), primitive(other.primitive), string_val(std::move(other.string_val)),
+      array_ptr(std::move(other.array_ptr)), object_ptr(std::move(other.object_ptr)) {
+	other.type = JsonValueType::UNINITIALIZED;
+}
+
+inline JsonValue &JsonValue::operator=(const JsonValue &other) {
+	if (this != &other) {
+		type = other.type;
+		primitive = other.primitive;
+		string_val = other.string_val;
+		if (other.array_ptr) {
+			array_ptr = make_uniq<JsonArray>(*other.array_ptr);
+		} else {
+			array_ptr.reset();
+		}
+		if (other.object_ptr) {
+			object_ptr = make_uniq<JsonObject>(*other.object_ptr);
+		} else {
+			object_ptr.reset();
+		}
+	}
+	return *this;
+}
+
+inline JsonValue &JsonValue::operator=(JsonValue &&other) noexcept {
+	if (this != &other) {
+		type = other.type;
+		primitive = other.primitive;
+		string_val = std::move(other.string_val);
+		array_ptr = std::move(other.array_ptr);
+		object_ptr = std::move(other.object_ptr);
+		other.type = JsonValueType::UNINITIALIZED;
+	}
+	return *this;
+}
+
+inline JsonValue JsonValue::MakeNull() {
+	JsonValue v;
+	v.type = JsonValueType::JSON_NULL;
+	return v;
+}
+
+inline JsonValue JsonValue::MakeBool(bool b) {
+	JsonValue v;
+	v.type = JsonValueType::BOOL_VAL;
+	v.primitive.bool_val = b;
+	return v;
+}
+
+inline JsonValue JsonValue::MakeInt64(int64_t n) {
+	JsonValue v;
+	v.type = JsonValueType::INT64_VAL;
+	v.primitive.int64_val = n;
+	return v;
+}
+
+inline JsonValue JsonValue::MakeUint64(uint64_t n) {
+	JsonValue v;
+	v.type = JsonValueType::UINT64_VAL;
+	v.primitive.uint64_val = n;
+	return v;
+}
+
+inline JsonValue JsonValue::MakeDouble(double d) {
+	JsonValue v;
+	v.type = JsonValueType::DOUBLE_VAL;
+	v.primitive.double_val = d;
+	return v;
+}
+
+inline JsonValue JsonValue::MakeString(std::string s) {
+	JsonValue v;
+	v.type = JsonValueType::STRING_VAL;
+	v.string_val = std::move(s);
+	return v;
+}
+
+inline JsonValue JsonValue::MakeArray(JsonArray arr) {
+	JsonValue v;
+	v.type = JsonValueType::ARRAY_VAL;
+	v.array_ptr = make_uniq<JsonArray>(std::move(arr));
+	return v;
+}
+
+inline JsonValue JsonValue::MakeObject(JsonObject obj) {
+	JsonValue v;
+	v.type = JsonValueType::OBJECT_VAL;
+	v.object_ptr = make_uniq<JsonObject>(std::move(obj));
+	return v;
+}
+
+inline JsonObject &JsonValue::AsObject() { return *object_ptr; }
+inline const JsonObject &JsonValue::AsObject() const { return *object_ptr; }
+
 struct JsonGroupMergeState {
-	yyjson_mut_doc *result_doc;
-	yyjson_mut_doc *patch_doc;
+	JsonObject *result_map;
+	JsonObject *patch_map;
+	JsonValue *scalar_replacement;  // Set when a non-object patch replaces the entire result
 	bool result_has_input;
 	bool patch_has_input;
 	bool patch_has_nulls;
-	idx_t result_replacements_since_compact;
-	idx_t patch_replacements_since_compact;
 };
 
 enum class JsonNullTreatment : uint8_t { DELETE_NULLS = 0, IGNORE_NULLS = 1 };
@@ -185,433 +533,320 @@ static JsonNullTreatment GetNullTreatment(optional_ptr<FunctionData> bind_data) 
 static unique_ptr<FunctionData> JsonGroupMergeBind(ClientContext &context, AggregateFunction &function,
                                                    vector<unique_ptr<Expression>> &arguments);
 
-static void JsonGroupMergeStateInit(JsonGroupMergeState &state) {
-	state.result_doc = yyjson_mut_doc_new(nullptr);
-	if (!state.result_doc) {
-		throw InternalException("json_group_merge: failed to allocate aggregate state");
-	}
-	state.patch_doc = yyjson_mut_doc_new(nullptr);
-	if (!state.patch_doc) {
-		yyjson_mut_doc_free(state.result_doc);
-		state.result_doc = nullptr;
-		throw InternalException("json_group_merge: failed to allocate aggregate state");
-	}
-	auto result_root = yyjson_mut_obj(state.result_doc);
-	if (!result_root) {
-		yyjson_mut_doc_free(state.patch_doc);
-		yyjson_mut_doc_free(state.result_doc);
-		state.patch_doc = nullptr;
-		state.result_doc = nullptr;
-		throw InternalException("json_group_merge: failed to allocate initial JSON object");
-	}
-	auto patch_root = yyjson_mut_obj(state.patch_doc);
-	if (!patch_root) {
-		yyjson_mut_doc_free(state.patch_doc);
-		yyjson_mut_doc_free(state.result_doc);
-		state.patch_doc = nullptr;
-		state.result_doc = nullptr;
-		throw InternalException("json_group_merge: failed to allocate initial JSON object");
-	}
-	yyjson_mut_doc_set_root(state.result_doc, result_root);
-	yyjson_mut_doc_set_root(state.patch_doc, patch_root);
-	state.result_has_input = false;
-	state.patch_has_input = false;
-	state.patch_has_nulls = false;
-	state.result_replacements_since_compact = 0;
-	state.patch_replacements_since_compact = 0;
-}
-
-static void JsonGroupMergeStateDestroy(JsonGroupMergeState &state) {
-	if (state.result_doc) {
-		yyjson_mut_doc_free(state.result_doc);
-		state.result_doc = nullptr;
-	}
-	if (state.patch_doc) {
-		yyjson_mut_doc_free(state.patch_doc);
-		state.patch_doc = nullptr;
-	}
-	state.result_has_input = false;
-	state.patch_has_input = false;
-	state.patch_has_nulls = false;
-	state.result_replacements_since_compact = 0;
-	state.patch_replacements_since_compact = 0;
-}
-
-constexpr idx_t JSON_GROUP_MERGE_COMPACT_THRESHOLD = 1024;
 // Maximum nesting depth to prevent stack exhaustion from pathological inputs
 constexpr idx_t MAX_JSON_NESTING_DEPTH = 1000;
 
-static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
-                                                        idx_t depth, idx_t &replacements_since_compact,
-                                                        JsonNullTreatment null_treatment, bool *saw_nulls);
-
-static void JsonGroupMergeCompactDoc(yyjson_mut_doc *&doc) {
-	if (!doc || !doc->root) {
-		return;
-	}
-	auto new_doc = yyjson_mut_doc_new(nullptr);
-	if (!new_doc) {
-		throw InternalException("json_group_merge: failed to compact aggregate state");
-	}
-	auto root_copy = yyjson_mut_val_mut_copy(new_doc, doc->root);
-	if (!root_copy) {
-		yyjson_mut_doc_free(new_doc);
-		throw InternalException("json_group_merge: failed to copy aggregate state during compaction");
-	}
-	yyjson_mut_doc_set_root(new_doc, root_copy);
-	yyjson_mut_doc_free(doc);
-	doc = new_doc;
+static void JsonGroupMergeStateInit(JsonGroupMergeState &state) {
+	state.result_map = new JsonObject();
+	state.patch_map = nullptr;
+	state.scalar_replacement = nullptr;
+	state.result_has_input = false;
+	state.patch_has_input = false;
+	state.patch_has_nulls = false;
 }
 
-static void JsonGroupMergeResetPatchDocFromResult(JsonGroupMergeState &state) {
-	if (!state.result_doc || !state.result_doc->root) {
-		yyjson_mut_doc_free(state.patch_doc);
-		state.patch_doc = yyjson_mut_doc_new(nullptr);
-		if (!state.patch_doc) {
-			throw InternalException("json_group_merge: failed to allocate aggregate state");
-		}
-		auto patch_root = yyjson_mut_obj(state.patch_doc);
-		if (!patch_root) {
-			yyjson_mut_doc_free(state.patch_doc);
-			state.patch_doc = nullptr;
-			throw InternalException("json_group_merge: failed to allocate initial JSON object");
-		}
-		yyjson_mut_doc_set_root(state.patch_doc, patch_root);
-		state.patch_has_input = false;
-		state.patch_replacements_since_compact = 0;
-		return;
+static void JsonGroupMergeStateDestroy(JsonGroupMergeState &state) {
+	if (state.result_map) {
+		delete state.result_map;
+		state.result_map = nullptr;
 	}
-
-	auto new_doc = yyjson_mut_doc_new(nullptr);
-	if (!new_doc) {
-		throw InternalException("json_group_merge: failed to allocate aggregate state");
+	if (state.patch_map) {
+		delete state.patch_map;
+		state.patch_map = nullptr;
 	}
-	auto root_copy = yyjson_mut_val_mut_copy(new_doc, state.result_doc->root);
-	if (!root_copy) {
-		yyjson_mut_doc_free(new_doc);
-		throw InternalException("json_group_merge: failed to copy aggregate state");
+	if (state.scalar_replacement) {
+		delete state.scalar_replacement;
+		state.scalar_replacement = nullptr;
 	}
-	yyjson_mut_doc_set_root(new_doc, root_copy);
-	yyjson_mut_doc_free(state.patch_doc);
-	state.patch_doc = new_doc;
-	state.patch_has_input = state.result_has_input;
-	state.patch_replacements_since_compact = 0;
+	state.result_has_input = false;
+	state.patch_has_input = false;
+	state.patch_has_nulls = false;
 }
 
-static void JsonGroupMergeMaybeCompact(JsonGroupMergeState &state) {
-	if (state.result_replacements_since_compact >= JSON_GROUP_MERGE_COMPACT_THRESHOLD) {
-		JsonGroupMergeCompactDoc(state.result_doc);
-		state.result_replacements_since_compact = 0;
-	}
-	if (state.patch_replacements_since_compact >= JSON_GROUP_MERGE_COMPACT_THRESHOLD) {
-		JsonGroupMergeCompactDoc(state.patch_doc);
-		state.patch_replacements_since_compact = 0;
-	}
-}
-
-static bool JsonGroupMergeApplyResultPatch(JsonGroupMergeState &state, yyjson_val *patch_root,
-                                           JsonNullTreatment null_treatment, bool *saw_nulls) {
-	if (!patch_root) {
-		throw InvalidInputException("json_group_merge: invalid JSON payload");
-	}
-	if (saw_nulls) {
-		*saw_nulls = false;
-	}
-	auto base_root = state.result_has_input ? state.result_doc->root : nullptr;
-	auto merged_root = JsonGroupMergeApplyPatchInternal(state.result_doc, base_root, patch_root, 0,
-	                                                    state.result_replacements_since_compact, null_treatment,
-	                                                    saw_nulls);
-	if (!merged_root) {
-		throw InternalException("json_group_merge: failed to merge JSON documents");
-	}
-	if (!state.result_has_input || merged_root != state.result_doc->root) {
-		yyjson_mut_doc_set_root(state.result_doc, merged_root);
-	}
-	state.result_has_input = true;
-	JsonGroupMergeMaybeCompact(state);
-	return saw_nulls ? *saw_nulls : false;
-}
-
-static yyjson_mut_val *JsonGroupMergeComposePatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
-                                                          idx_t depth, idx_t &replacements_since_compact,
-                                                          JsonNullTreatment null_treatment);
-
-static void JsonGroupMergeComposePatch(JsonGroupMergeState &state, yyjson_val *patch_root,
-                                       JsonNullTreatment null_treatment) {
-	if (!patch_root) {
-		throw InvalidInputException("json_group_merge: invalid JSON payload");
-	}
-	auto base_root = state.patch_has_input ? state.patch_doc->root : nullptr;
-	auto merged_root = JsonGroupMergeComposePatchInternal(state.patch_doc, base_root, patch_root, 0,
-	                                                      state.patch_replacements_since_compact, null_treatment);
-	if (!merged_root) {
-		throw InternalException("json_group_merge: failed to merge JSON documents");
-	}
-	if (!state.patch_has_input || merged_root != state.patch_doc->root) {
-		yyjson_mut_doc_set_root(state.patch_doc, merged_root);
-	}
-	state.patch_has_input = true;
-	JsonGroupMergeMaybeCompact(state);
-}
-
-static yyjson_mut_val *JsonGroupMergeApplyPatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
-                                                        idx_t depth, idx_t &replacements_since_compact,
-                                                        JsonNullTreatment null_treatment, bool *saw_nulls) {
-	if (!patch) {
-		return base;
+// Convert read-only yyjson_val to JsonValue
+static JsonValue ParseYyjsonValue(yyjson_val *val, idx_t depth) {
+	if (!val) {
+		return JsonValue();
 	}
 	if (depth > MAX_JSON_NESTING_DEPTH) {
 		throw InvalidInputException("json_group_merge: nesting depth exceeds maximum limit of " +
 		                            std::to_string(MAX_JSON_NESTING_DEPTH));
 	}
 
-	if (!duckdb_yyjson::yyjson_is_obj(patch)) {
-		auto copy = yyjson_val_mut_copy(doc, patch);
-		if (!copy) {
-			throw InternalException("json_group_merge: failed to materialize JSON value");
-		}
-		if (base) {
-			replacements_since_compact++;
-		}
-		return copy;
+	auto tag = duckdb_yyjson::yyjson_get_tag(val);
+	switch (tag) {
+	case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
+		return JsonValue::MakeNull();
+	case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
+		return JsonValue::MakeBool(true);
+	case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
+		return JsonValue::MakeBool(false);
+	case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_UINT:
+		return JsonValue::MakeUint64(duckdb_yyjson::yyjson_get_uint(val));
+	case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_SINT:
+		return JsonValue::MakeInt64(duckdb_yyjson::yyjson_get_sint(val));
+	case YYJSON_TYPE_NUM | YYJSON_SUBTYPE_REAL:
+		return JsonValue::MakeDouble(duckdb_yyjson::yyjson_get_real(val));
+	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE:
+	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC: {
+		auto str = duckdb_yyjson::yyjson_get_str(val);
+		auto len = duckdb_yyjson::yyjson_get_len(val);
+		return JsonValue::MakeString(std::string(str, len));
 	}
-
-	yyjson_mut_val *result = nullptr;
-	bool base_is_object = base && duckdb_yyjson::yyjson_mut_is_obj(base);
-	if (base_is_object) {
-		result = base;
-	}
-
-	auto EnsureResult = [&]() -> yyjson_mut_val * {
-		if (result) {
-			return result;
+	case YYJSON_TYPE_ARR | YYJSON_SUBTYPE_NONE: {
+		JsonArray arr;
+		yyjson_val *elem;
+		duckdb_yyjson::yyjson_arr_iter iter = duckdb_yyjson::yyjson_arr_iter_with(val);
+		while ((elem = duckdb_yyjson::yyjson_arr_iter_next(&iter))) {
+			arr.push_back(ParseYyjsonValue(elem, depth + 1));
 		}
-		result = yyjson_mut_obj(doc);
-		if (!result) {
+		return JsonValue::MakeArray(std::move(arr));
+	}
+	case YYJSON_TYPE_OBJ | YYJSON_SUBTYPE_NONE: {
+		JsonObject obj;
+		yyjson_val *key;
+		duckdb_yyjson::yyjson_obj_iter iter = duckdb_yyjson::yyjson_obj_iter_with(val);
+		while ((key = duckdb_yyjson::yyjson_obj_iter_next(&iter))) {
+			auto key_str = duckdb_yyjson::yyjson_get_str(key);
+			auto key_len = duckdb_yyjson::yyjson_get_len(key);
+			auto child_val = duckdb_yyjson::yyjson_obj_iter_get_val(key);
+			obj[std::string(key_str, key_len)] = ParseYyjsonValue(child_val, depth + 1);
+		}
+		return JsonValue::MakeObject(std::move(obj));
+	}
+	default:
+		throw InternalException("json_group_merge: unknown yyjson type tag");
+	}
+}
+
+// Forward declaration for recursive call
+static yyjson_mut_val *BuildYyjsonValue(yyjson_mut_doc *doc, const JsonValue &val);
+
+static yyjson_mut_val *BuildYyjsonValue(yyjson_mut_doc *doc, const JsonValue &val) {
+	if (val.IsUninitialized()) {
+		return nullptr;
+	}
+	if (val.IsNull()) {
+		return duckdb_yyjson::yyjson_mut_null(doc);
+	}
+	if (val.IsBool()) {
+		return duckdb_yyjson::yyjson_mut_bool(doc, val.AsBool());
+	}
+	if (val.IsInt64()) {
+		return duckdb_yyjson::yyjson_mut_sint(doc, val.AsInt64());
+	}
+	if (val.IsUint64()) {
+		return duckdb_yyjson::yyjson_mut_uint(doc, val.AsUint64());
+	}
+	if (val.IsDouble()) {
+		return duckdb_yyjson::yyjson_mut_real(doc, val.AsDouble());
+	}
+	if (val.IsString()) {
+		const auto &s = val.AsString();
+		return duckdb_yyjson::yyjson_mut_strncpy(doc, s.c_str(), s.size());
+	}
+	if (val.IsArray()) {
+		auto arr = duckdb_yyjson::yyjson_mut_arr(doc);
+		if (!arr) {
+			throw InternalException("json_group_merge: failed to allocate JSON array");
+		}
+		for (const auto &elem : val.AsArray()) {
+			auto elem_val = BuildYyjsonValue(doc, elem);
+			if (elem_val && !duckdb_yyjson::yyjson_mut_arr_append(arr, elem_val)) {
+				throw InternalException("json_group_merge: failed to append array element");
+			}
+		}
+		return arr;
+	}
+	if (val.IsObject()) {
+		auto obj = duckdb_yyjson::yyjson_mut_obj(doc);
+		if (!obj) {
 			throw InternalException("json_group_merge: failed to allocate JSON object");
 		}
-		if (base && !base_is_object) {
-			replacements_since_compact++;
+		for (const auto &kv : val.AsObject()) {
+			auto key = duckdb_yyjson::yyjson_mut_strncpy(doc, kv.first.c_str(), kv.first.size());
+			auto child = BuildYyjsonValue(doc, kv.second);
+			if (key && child && !duckdb_yyjson::yyjson_mut_obj_add(obj, key, child)) {
+				throw InternalException("json_group_merge: failed to add object member");
+			}
 		}
-		return result;
-	};
+		return obj;
+	}
+	throw InternalException("json_group_merge: unexpected JsonValue variant");
+}
 
-	bool applied_any = false;
+// Apply patch to target map (result_map) - implements JSON merge patch semantics
+static void ApplyPatchToMap(JsonObject &target, yyjson_val *patch, idx_t depth,
+                            JsonNullTreatment null_treatment, bool *saw_nulls) {
+	if (!patch) {
+		return;
+	}
+	if (depth > MAX_JSON_NESTING_DEPTH) {
+		throw InvalidInputException("json_group_merge: nesting depth exceeds maximum limit of " +
+		                            std::to_string(MAX_JSON_NESTING_DEPTH));
+	}
 
 	yyjson_val *patch_key = nullptr;
-	yyjson_obj_iter patch_iter = yyjson_obj_iter_with(patch);
-	while ((patch_key = yyjson_obj_iter_next(&patch_iter))) {
+	duckdb_yyjson::yyjson_obj_iter patch_iter = duckdb_yyjson::yyjson_obj_iter_with(patch);
+	while ((patch_key = duckdb_yyjson::yyjson_obj_iter_next(&patch_iter))) {
 		auto key_str = duckdb_yyjson::yyjson_get_str(patch_key);
 		auto key_len = duckdb_yyjson::yyjson_get_len(patch_key);
-		auto patch_val = yyjson_obj_iter_get_val(patch_key);
+		auto patch_val = duckdb_yyjson::yyjson_obj_iter_get_val(patch_key);
 
 		if (!key_str) {
 			throw InvalidInputException("json_group_merge: encountered non-string object key");
 		}
+
+		std::string key(key_str, key_len);
 
 		if (duckdb_yyjson::yyjson_is_null(patch_val)) {
 			if (saw_nulls) {
 				*saw_nulls = true;
 			}
 			if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
-				if (result) {
-					auto removed = duckdb_yyjson::yyjson_mut_obj_remove_keyn(result, key_str, key_len);
-					if (removed) {
-						replacements_since_compact++;
-						applied_any = true;
-					}
-				}
+				target.Erase(key);  // O(1) average
 			}
 			continue;
 		}
 
 		if (duckdb_yyjson::yyjson_is_obj(patch_val)) {
-			auto existing_child = result ? duckdb_yyjson::yyjson_mut_obj_getn(result, key_str, key_len) : nullptr;
-			auto merged_child = JsonGroupMergeApplyPatchInternal(doc, existing_child, patch_val, depth + 1,
-			                                                     replacements_since_compact, null_treatment, saw_nulls);
-			if (!merged_child) {
-				continue;
-			}
-			if (!existing_child || merged_child != existing_child) {
-				auto target_obj = EnsureResult();
-				if (existing_child) {
-					replacements_since_compact++;
-					duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
+			// Recursive merge for nested objects
+			auto existing = target.Find(key);  // O(1) average
+			if (existing && existing->IsObject()) {
+				// Existing value is object - merge into it
+				ApplyPatchToMap(existing->AsObject(), patch_val, depth + 1, null_treatment, saw_nulls);
+			} else {
+				// Create new object and recursively apply patch (to filter nulls in IGNORE_NULLS mode)
+				JsonObject new_obj;
+				ApplyPatchToMap(new_obj, patch_val, depth + 1, null_treatment, saw_nulls);
+				// Only store if non-empty (all-null patches should not create empty objects)
+				if (!new_obj.Empty()) {
+					target[key] = JsonValue::MakeObject(std::move(new_obj));
 				}
-				auto key_copy = yyjson_mut_strncpy(doc, key_str, key_len);
-				if (!key_copy) {
-					throw InternalException("json_group_merge: failed to allocate key storage");
-				}
-				if (!duckdb_yyjson::yyjson_mut_obj_add(target_obj, key_copy, merged_child)) {
-					throw InternalException("json_group_merge: failed to append merged object value");
-				}
-				applied_any = true;
 			}
 			continue;
 		}
 
-		auto new_child = yyjson_val_mut_copy(doc, patch_val);
-		if (!new_child) {
-			throw InternalException("json_group_merge: failed to copy JSON value");
-		}
-		auto target_obj = EnsureResult();
-		auto removed = duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
-		if (removed) {
-			replacements_since_compact++;
-		}
-		auto key_copy = yyjson_mut_strncpy(doc, key_str, key_len);
-		if (!key_copy) {
-			throw InternalException("json_group_merge: failed to allocate key storage");
-		}
-		if (!duckdb_yyjson::yyjson_mut_obj_add(target_obj, key_copy, new_child)) {
-			throw InternalException("json_group_merge: failed to append merged value");
-		}
-		applied_any = true;
+		// For all other types, replace directly
+		target[key] = ParseYyjsonValue(patch_val, depth + 1);  // O(1) average
 	}
-
-	// If nothing was applied, return the base unchanged (unless we're at top level with nothing)
-	if (!applied_any) {
-		// Special case: at top level with no base and empty patch, return empty object
-		if (depth == 0 && !base) {
-			return EnsureResult();
-		}
-		return base;
-	}
-
-	// Something was applied, ensure we have a result object to return
-	return result ? result : EnsureResult();
 }
 
-static yyjson_mut_val *JsonGroupMergeComposePatchInternal(yyjson_mut_doc *doc, yyjson_mut_val *base, yyjson_val *patch,
-                                                          idx_t depth, idx_t &replacements_since_compact,
-                                                          JsonNullTreatment null_treatment) {
+// Compose patch into patch_map (for DELETE_NULLS mode) - preserves null markers
+static void ComposePatchToMap(JsonObject &target, yyjson_val *patch, idx_t depth,
+                              JsonNullTreatment null_treatment) {
 	if (!patch) {
-		return base;
+		return;
 	}
 	if (depth > MAX_JSON_NESTING_DEPTH) {
 		throw InvalidInputException("json_group_merge: nesting depth exceeds maximum limit of " +
 		                            std::to_string(MAX_JSON_NESTING_DEPTH));
 	}
-	if (!duckdb_yyjson::yyjson_is_obj(patch)) {
-		auto copy = yyjson_val_mut_copy(doc, patch);
-		if (!copy) {
-			throw InternalException("json_group_merge: failed to materialize JSON value");
-		}
-		if (base) {
-			replacements_since_compact++;
-		}
-		return copy;
-	}
-
-	yyjson_mut_val *result = nullptr;
-	bool base_is_object = base && duckdb_yyjson::yyjson_mut_is_obj(base);
-	if (base_is_object) {
-		result = base;
-	}
-
-	auto EnsureResult = [&]() -> yyjson_mut_val * {
-		if (result) {
-			return result;
-		}
-		result = yyjson_mut_obj(doc);
-		if (!result) {
-			throw InternalException("json_group_merge: failed to allocate JSON object");
-		}
-		if (base && !base_is_object) {
-			replacements_since_compact++;
-		}
-		return result;
-	};
-
-	bool applied_any = false;
 
 	yyjson_val *patch_key = nullptr;
-	yyjson_obj_iter patch_iter = yyjson_obj_iter_with(patch);
-	while ((patch_key = yyjson_obj_iter_next(&patch_iter))) {
+	duckdb_yyjson::yyjson_obj_iter patch_iter = duckdb_yyjson::yyjson_obj_iter_with(patch);
+	while ((patch_key = duckdb_yyjson::yyjson_obj_iter_next(&patch_iter))) {
 		auto key_str = duckdb_yyjson::yyjson_get_str(patch_key);
 		auto key_len = duckdb_yyjson::yyjson_get_len(patch_key);
-		auto patch_val = yyjson_obj_iter_get_val(patch_key);
+		auto patch_val = duckdb_yyjson::yyjson_obj_iter_get_val(patch_key);
 
 		if (!key_str) {
 			throw InvalidInputException("json_group_merge: encountered non-string object key");
 		}
 
+		std::string key(key_str, key_len);
+
 		if (duckdb_yyjson::yyjson_is_null(patch_val)) {
 			if (null_treatment == JsonNullTreatment::IGNORE_NULLS) {
 				continue;
 			}
-			auto target_obj = EnsureResult();
-			auto removed = duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
-			if (removed) {
-				replacements_since_compact++;
-			}
-			auto key_copy = yyjson_mut_strncpy(doc, key_str, key_len);
-			if (!key_copy) {
-				throw InternalException("json_group_merge: failed to allocate key storage");
-			}
-			auto null_value = yyjson_mut_null(doc);
-			if (!null_value) {
-				throw InternalException("json_group_merge: failed to allocate JSON null value");
-			}
-			if (!duckdb_yyjson::yyjson_mut_obj_add(target_obj, key_copy, null_value)) {
-				throw InternalException("json_group_merge: failed to append merged value");
-			}
-			applied_any = true;
+			// DELETE_NULLS: store the null marker for replay during Combine
+			target[key] = JsonValue::MakeNull();
 			continue;
 		}
 
 		if (duckdb_yyjson::yyjson_is_obj(patch_val)) {
-			auto existing_child = result ? duckdb_yyjson::yyjson_mut_obj_getn(result, key_str, key_len) : nullptr;
-			auto merged_child = JsonGroupMergeComposePatchInternal(doc, existing_child, patch_val, depth + 1,
-			                                                       replacements_since_compact, null_treatment);
-			if (!merged_child) {
-				continue;
-			}
-			if (!existing_child || merged_child != existing_child) {
-				auto target_obj = EnsureResult();
-				if (existing_child) {
-					replacements_since_compact++;
-					duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
-				}
-				auto key_copy = yyjson_mut_strncpy(doc, key_str, key_len);
-				if (!key_copy) {
-					throw InternalException("json_group_merge: failed to allocate key storage");
-				}
-				if (!duckdb_yyjson::yyjson_mut_obj_add(target_obj, key_copy, merged_child)) {
-					throw InternalException("json_group_merge: failed to append merged object value");
-				}
-				applied_any = true;
+			auto existing = target.Find(key);
+			if (existing && existing->IsObject()) {
+				ComposePatchToMap(existing->AsObject(), patch_val, depth + 1, null_treatment);
+			} else {
+				target[key] = ParseYyjsonValue(patch_val, depth + 1);
 			}
 			continue;
 		}
 
-		auto new_child = yyjson_val_mut_copy(doc, patch_val);
-		if (!new_child) {
-			throw InternalException("json_group_merge: failed to copy JSON value");
-		}
-		auto target_obj = EnsureResult();
-		auto removed = duckdb_yyjson::yyjson_mut_obj_remove_keyn(target_obj, key_str, key_len);
-		if (removed) {
-			replacements_since_compact++;
-		}
-		auto key_copy = yyjson_mut_strncpy(doc, key_str, key_len);
-		if (!key_copy) {
-			throw InternalException("json_group_merge: failed to allocate key storage");
-		}
-		if (!duckdb_yyjson::yyjson_mut_obj_add(target_obj, key_copy, new_child)) {
-			throw InternalException("json_group_merge: failed to append merged value");
-		}
-		applied_any = true;
+		target[key] = ParseYyjsonValue(patch_val, depth + 1);
+	}
+}
+
+// Apply JsonObject patch to target map (for Combine)
+static void ApplyMapToMap(JsonObject &target, const JsonObject &source, idx_t depth,
+                          JsonNullTreatment null_treatment, bool *saw_nulls) {
+	if (depth > MAX_JSON_NESTING_DEPTH) {
+		throw InvalidInputException("json_group_merge: nesting depth exceeds maximum limit of " +
+		                            std::to_string(MAX_JSON_NESTING_DEPTH));
 	}
 
-	if (!applied_any) {
-		if (depth == 0 && !base) {
-			return EnsureResult();
+	for (const auto &kv : source) {
+		const auto &key = kv.first;
+		const auto &val = kv.second;
+
+		if (val.IsNull()) {
+			if (saw_nulls) {
+				*saw_nulls = true;
+			}
+			if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
+				target.Erase(key);
+			}
+			continue;
 		}
-		return base;
+
+		if (val.IsObject()) {
+			auto existing = target.Find(key);
+			if (existing && existing->IsObject()) {
+				ApplyMapToMap(existing->AsObject(), val.AsObject(), depth + 1, null_treatment, saw_nulls);
+			} else {
+				target[key] = val;
+			}
+			continue;
+		}
+
+		target[key] = val;
+	}
+}
+
+// Compose map into patch_map (for Combine in DELETE_NULLS mode)
+static void ComposeMapToMap(JsonObject &target, const JsonObject &source, idx_t depth,
+                            JsonNullTreatment null_treatment) {
+	if (depth > MAX_JSON_NESTING_DEPTH) {
+		throw InvalidInputException("json_group_merge: nesting depth exceeds maximum limit of " +
+		                            std::to_string(MAX_JSON_NESTING_DEPTH));
 	}
 
-	return result ? result : EnsureResult();
+	for (const auto &kv : source) {
+		const auto &key = kv.first;
+		const auto &val = kv.second;
+
+		if (val.IsNull()) {
+			if (null_treatment == JsonNullTreatment::IGNORE_NULLS) {
+				continue;
+			}
+			target[key] = JsonValue::MakeNull();
+			continue;
+		}
+
+		if (val.IsObject()) {
+			auto existing = target.Find(key);
+			if (existing && existing->IsObject()) {
+				ComposeMapToMap(existing->AsObject(), val.AsObject(), depth + 1, null_treatment);
+			} else {
+				target[key] = val;
+			}
+			continue;
+		}
+
+		target[key] = val;
+	}
 }
 
 class JsonGroupMergeFunction {
@@ -625,36 +860,68 @@ public:
 		JsonGroupMergeStateDestroy(state);
 	}
 
-	static inline string JsonParseError(const string_t &input, yyjson_read_err &err) {
+	static inline string JsonParseError(const string_t &input, duckdb_yyjson::yyjson_read_err &err) {
 		return JSONCommon::FormatParseError(input.GetDataUnsafe(), input.GetSize(), err);
 	}
 
 	template <class INPUT_TYPE, class STATE, class OP>
 	static void Operation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &unary_input) {
 		static_assert(std::is_same<INPUT_TYPE, string_t>::value, "json_group_merge expects string_t input");
-		yyjson_read_err err;
-		auto doc = yyjson_read_opts(const_cast<char *>(input.GetDataUnsafe()), input.GetSize(), JSONCommon::READ_FLAG,
-		                            nullptr, &err);
+		duckdb_yyjson::yyjson_read_err err;
+		auto doc = duckdb_yyjson::yyjson_read_opts(const_cast<char *>(input.GetDataUnsafe()), input.GetSize(),
+		                                           JSONCommon::READ_FLAG, nullptr, &err);
 		if (!doc) {
 			throw InvalidInputException("json_group_merge: %s", JsonParseError(input, err));
 		}
 		yyjson_doc_ptr patch_doc(doc);
-		auto patch_root = yyjson_doc_get_root(patch_doc.get());
+		auto patch_root = duckdb_yyjson::yyjson_doc_get_root(patch_doc.get());
 		if (!patch_root) {
 			throw InvalidInputException("json_group_merge: invalid JSON payload");
 		}
+
 		auto null_treatment = GetNullTreatment(unary_input.input.bind_data);
+
+		// Non-object patch replaces the entire result (JSON merge patch semantics)
+		if (!duckdb_yyjson::yyjson_is_obj(patch_root)) {
+			if (state.scalar_replacement) {
+				delete state.scalar_replacement;
+			}
+			state.scalar_replacement = new JsonValue(ParseYyjsonValue(patch_root, 0));
+			// Clear the hash map since it's replaced
+			state.result_map->Clear();
+			state.result_has_input = true;
+			// Clear patch tracking as well
+			if (state.patch_map) {
+				delete state.patch_map;
+				state.patch_map = nullptr;
+			}
+			state.patch_has_input = false;
+			state.patch_has_nulls = false;
+			return;
+		}
+
+		// Object patch: if there was a scalar replacement, reset to object mode
+		if (state.scalar_replacement) {
+			delete state.scalar_replacement;
+			state.scalar_replacement = nullptr;
+		}
+
 		bool saw_nulls = false;
-		JsonGroupMergeApplyResultPatch(state, patch_root, null_treatment, &saw_nulls);
-		// For IGNORE_NULLS mode, result_doc == patch_doc semantically, so skip building patch_doc.
-		// patch_doc is only needed in Combine() for DELETE_NULLS mode to replay deletions.
+
+		// Apply patch to result_map using O(1) hash map operations
+		ApplyPatchToMap(*state.result_map, patch_root, 0, null_treatment, &saw_nulls);
+		state.result_has_input = true;
+
+		// For DELETE_NULLS mode, also compose into patch_map for Combine replay
 		if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
 			if (state.patch_has_nulls || saw_nulls) {
 				if (!state.patch_has_nulls) {
-					JsonGroupMergeResetPatchDocFromResult(state);
+					// First time seeing nulls: copy result_map to patch_map
+					state.patch_map = new JsonObject(*state.result_map);
 					state.patch_has_nulls = true;
 				}
-				JsonGroupMergeComposePatch(state, patch_root, null_treatment);
+				ComposePatchToMap(*state.patch_map, patch_root, 0, null_treatment);
+				state.patch_has_input = true;
 			}
 		}
 	}
@@ -669,57 +936,113 @@ public:
 
 	template <class STATE, class OP>
 	static void Combine(const STATE &source, STATE &target, AggregateInputData &aggr_input_data) {
-		auto null_treatment = GetNullTreatment(aggr_input_data.bind_data);
-
-		// For IGNORE_NULLS: use result_doc directly (semantically identical to patch_doc)
-		// For DELETE_NULLS: use patch_doc which preserves explicit null markers for replay
-		yyjson_mut_doc *source_doc = nullptr;
-		bool source_has_input = false;
-
-		if (null_treatment == JsonNullTreatment::IGNORE_NULLS || !source.patch_has_nulls) {
-			source_doc = source.result_doc;
-			source_has_input = source.result_has_input;
-		} else {
-			source_doc = source.patch_doc;
-			source_has_input = source.patch_has_input;
-		}
-
-		if (!source_has_input || !source_doc || !source_doc->root) {
+		if (!source.result_has_input) {
 			return;
 		}
 
-		auto source_doc_ptr = yyjson_doc_ptr(yyjson_mut_val_imut_copy(source_doc->root, nullptr));
-		if (!source_doc_ptr) {
-			throw InternalException("json_group_merge: failed to materialize source state");
+		auto null_treatment = GetNullTreatment(aggr_input_data.bind_data);
+
+		// If source has a scalar replacement, it replaces everything
+		if (source.scalar_replacement) {
+			if (target.scalar_replacement) {
+				delete target.scalar_replacement;
+			}
+			target.scalar_replacement = new JsonValue(*source.scalar_replacement);
+			target.result_map->Clear();
+			target.result_has_input = true;
+			if (target.patch_map) {
+				delete target.patch_map;
+				target.patch_map = nullptr;
+			}
+			target.patch_has_input = false;
+			target.patch_has_nulls = false;
+			return;
 		}
-		auto patch_root = yyjson_doc_get_root(source_doc_ptr.get());
-		if (!patch_root) {
-			throw InternalException("json_group_merge: failed to materialize source state");
+
+		// Source is an object: if target has scalar replacement, clear it first
+		if (target.scalar_replacement) {
+			delete target.scalar_replacement;
+			target.scalar_replacement = nullptr;
+		}
+
+		// For IGNORE_NULLS: use result_map directly
+		// For DELETE_NULLS: use patch_map which preserves explicit null markers for replay
+		const JsonObject *source_map = nullptr;
+		bool source_has_input = false;
+
+		if (null_treatment == JsonNullTreatment::IGNORE_NULLS || !source.patch_has_nulls) {
+			source_map = source.result_map;
+			source_has_input = source.result_has_input;
+		} else {
+			source_map = source.patch_map;
+			source_has_input = source.patch_has_input;
+		}
+
+		if (!source_has_input || !source_map || source_map->Empty()) {
+			return;
 		}
 
 		bool saw_nulls = false;
-		JsonGroupMergeApplyResultPatch(target, patch_root, null_treatment, &saw_nulls);
-		// For DELETE_NULLS, update target's patch_doc for further combines when needed
+		ApplyMapToMap(*target.result_map, *source_map, 0, null_treatment, &saw_nulls);
+		target.result_has_input = true;
+
+		// For DELETE_NULLS, update target's patch_map for further combines when needed
 		if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
 			if (target.patch_has_nulls || saw_nulls) {
 				if (!target.patch_has_nulls) {
-					JsonGroupMergeResetPatchDocFromResult(target);
+					target.patch_map = new JsonObject(*target.result_map);
 					target.patch_has_nulls = true;
 				}
-				JsonGroupMergeComposePatch(target, patch_root, null_treatment);
+				ComposeMapToMap(*target.patch_map, *source_map, 0, null_treatment);
+				target.patch_has_input = true;
 			}
 		}
 	}
 
 	template <class RESULT_TYPE, class STATE>
 	static void Finalize(STATE &state, RESULT_TYPE &target, AggregateFinalizeData &finalize_data) {
-		if (!state.result_doc || !state.result_doc->root) {
+		if (!state.result_map) {
 			finalize_data.ReturnNull();
 			return;
 		}
+
+		// Build yyjson document
+		auto doc = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
+		if (!doc) {
+			throw InternalException("json_group_merge: failed to allocate output document");
+		}
+		std::unique_ptr<duckdb_yyjson::yyjson_mut_doc, decltype(&duckdb_yyjson::yyjson_mut_doc_free)>
+		    doc_ptr(doc, duckdb_yyjson::yyjson_mut_doc_free);
+
+		duckdb_yyjson::yyjson_mut_val *root;
+
+		// If scalar replacement is set, use it instead of the hash map
+		if (state.scalar_replacement) {
+			root = BuildYyjsonValue(doc, *state.scalar_replacement);
+			if (!root) {
+				throw InternalException("json_group_merge: failed to build output value");
+			}
+		} else {
+			// Build object from hash map
+			root = duckdb_yyjson::yyjson_mut_obj(doc);
+			if (!root) {
+				throw InternalException("json_group_merge: failed to allocate output object");
+			}
+
+			// Populate from hash map
+			for (const auto &kv : *state.result_map) {
+				auto key = duckdb_yyjson::yyjson_mut_strncpy(doc, kv.first.c_str(), kv.first.size());
+				auto val = BuildYyjsonValue(doc, kv.second);
+				if (key && val && !duckdb_yyjson::yyjson_mut_obj_add(root, key, val)) {
+					throw InternalException("json_group_merge: failed to add object member");
+				}
+			}
+		}
+		duckdb_yyjson::yyjson_mut_doc_set_root(doc, root);
+
 		size_t output_length = 0;
-		auto output_cstr =
-		    yyjson_mut_write_opts(state.result_doc, JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
+		auto output_cstr = duckdb_yyjson::yyjson_mut_write_opts(doc, JSONCommon::WRITE_FLAG, nullptr,
+		                                                        &output_length, nullptr);
 		if (!output_cstr) {
 			throw InternalException("json_group_merge: failed to serialize aggregate result");
 		}

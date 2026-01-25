@@ -36,6 +36,38 @@ FROM (VALUES ('{"flag":true}'::json, 1), ('{"flag":false}'::json, 2)) AS t(patch
 {"flag":false}
 
 # ========================================
+# Empty Key Handling
+# ========================================
+
+# Empty string is a valid JSON key
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"":1}'::json, 1), ('{"a":2}'::json, 2)) AS t(patch, ts);
+----
+{"":1,"a":2}
+
+# Empty key with nested object
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"outer":{"":42}}'::json, 1)) AS t(patch, ts);
+----
+{"outer":{"":42}}
+
+# Empty key update
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"":1}'::json, 1), ('{"":2}'::json, 2)) AS t(patch, ts);
+----
+{"":2}
+
+# Empty key deletion with DELETE NULLS
+query I
+SELECT json_group_merge(patch ORDER BY ts)
+FROM (VALUES ('{"":1,"keep":2}'::json, 1), ('{"":null}'::json, 2)) AS t(patch, ts);
+----
+{"keep":2}
+
+# ========================================
 # NULL Handling
 # ========================================
 
