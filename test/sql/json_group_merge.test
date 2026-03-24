@@ -242,6 +242,10 @@ beta	{"state":{"mode":"light"}}
 # Window Aggregation
 # ========================================
 
+# Workaround for https://github.com/duckdb/duckdb/issues/21592
+statement ok
+SET disabled_optimizers = 'window_self_join';
+
 query IT
 SELECT seq,
        json_group_merge(patch ORDER BY seq)
