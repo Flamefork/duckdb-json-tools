@@ -8,5 +8,5 @@ dependencies = [
     "black>=25.9.0",
     "clang-format>=11.0.1",
     "cmake-format>=0.6.13",
-    "duckdb>=1.5.1",
+    "duckdb>=1.5.2",
 ]
