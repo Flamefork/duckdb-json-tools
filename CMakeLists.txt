@@ -23,6 +23,10 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 
+# ankerl::unordered_dense (vendored in src/include/ankerl) requires C++17.
+target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
+target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
+
 install(
   TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"

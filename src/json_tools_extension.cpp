@@ -16,6 +16,7 @@
 #include "duckdb/function/scalar/regexp.hpp"
 #include "re2/set.h"
 #include "../duckdb/extension/json/include/json_common.hpp"
+#include "ankerl/unordered_dense.h"
 #include "yyjson.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 
@@ -431,7 +432,7 @@ private:
 	}
 
 	std::vector<Entry> entries_;
-	std::unordered_map<std::string, idx_t> index_;
+	ankerl::unordered_dense::map<std::string, idx_t> index_;
 };
 
 // JsonValue method implementations (after JsonObject is defined)

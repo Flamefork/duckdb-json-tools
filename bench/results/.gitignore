@@ -1,3 +1,4 @@
 *.json
 !baseline.json
 profiles/
+samply/
