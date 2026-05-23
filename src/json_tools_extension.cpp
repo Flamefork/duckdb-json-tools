@@ -590,7 +590,9 @@ static unique_ptr<FunctionData> JsonGroupMergeBind(ClientContext &context, Aggre
 constexpr idx_t MAX_JSON_NESTING_DEPTH = 1000;
 
 static void JsonGroupMergeStateInit(JsonGroupMergeState &state) {
-	state.result_map = new JsonObject();
+	// result_map / patch_map are lazily allocated on first non-NULL input,
+	// so empty groups (frequent with high-cardinality GROUP BY) skip the alloc.
+	state.result_map = nullptr;
 	state.patch_map = nullptr;
 	state.scalar_replacement = nullptr;
 	state.result_has_input = false;
@@ -614,6 +616,13 @@ static void JsonGroupMergeStateDestroy(JsonGroupMergeState &state) {
 	state.result_has_input = false;
 	state.patch_has_input = false;
 	state.patch_has_nulls = false;
+}
+
+static JsonObject &EnsureResultMap(JsonGroupMergeState &state) {
+	if (!state.result_map) {
+		state.result_map = new JsonObject();
+	}
+	return *state.result_map;
 }
 
 // Convert read-only yyjson_val to JsonValue
@@ -932,6 +941,7 @@ public:
 		}
 
 		auto null_treatment = GetNullTreatment(unary_input.input.bind_data);
+		auto &result_map = EnsureResultMap(state);
 
 		// Non-object patch replaces the entire result (JSON merge patch semantics)
 		if (!duckdb_yyjson::yyjson_is_obj(patch_root)) {
@@ -940,7 +950,7 @@ public:
 			}
 			state.scalar_replacement = new JsonValue(ParseYyjsonValue(patch_root, 0));
 			// Clear the hash map since it's replaced
-			state.result_map->Clear();
+			result_map.Clear();
 			state.result_has_input = true;
 			// Clear patch tracking as well
 			if (state.patch_map) {
@@ -961,7 +971,7 @@ public:
 		bool saw_nulls = false;
 
 		// Apply patch to result_map using O(1) hash map operations
-		ApplyPatchToMap(*state.result_map, patch_root, 0, null_treatment, &saw_nulls);
+		ApplyPatchToMap(result_map, patch_root, 0, null_treatment, &saw_nulls);
 		state.result_has_input = true;
 
 		// For DELETE_NULLS mode, also compose into patch_map for Combine replay
@@ -969,7 +979,7 @@ public:
 			if (state.patch_has_nulls || saw_nulls) {
 				if (!state.patch_has_nulls) {
 					// First time seeing nulls: copy result_map to patch_map
-					state.patch_map = new JsonObject(*state.result_map);
+					state.patch_map = new JsonObject(result_map);
 					state.patch_has_nulls = true;
 				}
 				ComposePatchToMap(*state.patch_map, patch_root, 0, null_treatment);
@@ -993,6 +1003,7 @@ public:
 		}
 
 		auto null_treatment = GetNullTreatment(aggr_input_data.bind_data);
+		auto &target_result = EnsureResultMap(target);
 
 		// If source has a scalar replacement, it replaces everything
 		if (source.scalar_replacement) {
@@ -1000,7 +1011,7 @@ public:
 				delete target.scalar_replacement;
 			}
 			target.scalar_replacement = new JsonValue(*source.scalar_replacement);
-			target.result_map->Clear();
+			target_result.Clear();
 			target.result_has_input = true;
 			if (target.patch_map) {
 				delete target.patch_map;
@@ -1035,14 +1046,14 @@ public:
 		}
 
 		bool saw_nulls = false;
-		ApplyMapToMap(*target.result_map, *source_map, 0, null_treatment, &saw_nulls);
+		ApplyMapToMap(target_result, *source_map, 0, null_treatment, &saw_nulls);
 		target.result_has_input = true;
 
 		// For DELETE_NULLS, update target's patch_map for further combines when needed
 		if (null_treatment == JsonNullTreatment::DELETE_NULLS) {
 			if (target.patch_has_nulls || saw_nulls) {
 				if (!target.patch_has_nulls) {
-					target.patch_map = new JsonObject(*target.result_map);
+					target.patch_map = new JsonObject(target_result);
 					target.patch_has_nulls = true;
 				}
 				ComposeMapToMap(*target.patch_map, *source_map, 0, null_treatment);
@@ -1053,8 +1064,10 @@ public:
 
 	template <class RESULT_TYPE, class STATE>
 	static void Finalize(STATE &state, RESULT_TYPE &target, AggregateFinalizeData &finalize_data) {
-		if (!state.result_map) {
-			finalize_data.ReturnNull();
+		// All-NULL / empty group: result_map was never lazily allocated.
+		// Preserve historical behavior of emitting an empty object.
+		if (!state.result_map && !state.scalar_replacement) {
+			target = StringVector::AddString(finalize_data.result, "{}", 2);
 			return;
 		}
 
