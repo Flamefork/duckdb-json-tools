@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "generated_at": "2026-05-23T23:11:35+00:00",
+  "generated_at": "2026-05-23T23:56:31+00:00",
   "environment": {
     "build_type": "release",
     "os": "Darwin",
@@ -8,8 +8,8 @@
     "cpu_model": "Apple M2 Max",
     "cpu_cores": 12,
     "duckdb_version": "v1.5.3",
-    "git_commit": "55dd7ec5c1da64e32f9c83b62c8868df7328f4c2",
-    "git_dirty": false,
+    "git_commit": "e46cc91446f73e54009fbc59d0524cdab6bba876",
+    "git_dirty": true,
     "duckdb_python_package_version": "1.5.3",
     "dataset": {
       "seed": 42,
@@ -31,9 +31,9 @@
       "function": "json_flatten",
       "scenario": "basic",
       "size": "1k",
-      "min_ms": 2.62,
-      "median_ms": 2.81,
-      "max_ms": 3.09,
+      "min_ms": 2.55,
+      "median_ms": 2.69,
+      "max_ms": 3.03,
       "runs": 10
     },
     {
@@ -41,8 +41,8 @@
       "function": "json_add_prefix",
       "scenario": "basic",
       "size": "1k",
-      "min_ms": 2.59,
-      "median_ms": 2.77,
+      "min_ms": 2.45,
+      "median_ms": 2.6,
       "max_ms": 2.89,
       "runs": 10
     },
@@ -51,9 +51,9 @@
       "function": "json_extract_columns",
       "scenario": "etl_core",
       "size": "1k",
-      "min_ms": 2.09,
-      "median_ms": 2.4,
-      "max_ms": 2.54,
+      "min_ms": 1.98,
+      "median_ms": 2.06,
+      "max_ms": 2.23,
       "runs": 10
     },
     {
@@ -61,9 +61,9 @@
       "function": "json_extract_columns",
       "scenario": "etl_full",
       "size": "1k",
-      "min_ms": 3.59,
-      "median_ms": 3.85,
-      "max_ms": 4.03,
+      "min_ms": 3.13,
+      "median_ms": 3.39,
+      "max_ms": 3.65,
       "runs": 10
     },
     {
@@ -71,9 +71,9 @@
       "function": "json_extract_columns",
       "scenario": "prefix_buckets",
       "size": "1k",
-      "min_ms": 2.53,
-      "median_ms": 2.65,
-      "max_ms": 2.89,
+      "min_ms": 2.35,
+      "median_ms": 2.42,
+      "max_ms": 2.66,
       "runs": 10
     },
     {
@@ -81,9 +81,9 @@
       "function": "json_extract_columns",
       "scenario": "mixed_50",
       "size": "1k",
-      "min_ms": 5.21,
-      "median_ms": 5.48,
-      "max_ms": 5.78,
+      "min_ms": 4.9,
+      "median_ms": 5.05,
+      "max_ms": 5.29,
       "runs": 10
     },
     {
@@ -91,9 +91,9 @@
       "function": "json_group_merge",
       "scenario": "few_groups",
       "size": "1k",
-      "min_ms": 2.58,
-      "median_ms": 2.78,
-      "max_ms": 2.93,
+      "min_ms": 2.46,
+      "median_ms": 2.72,
+      "max_ms": 2.92,
       "runs": 10
     },
     {
@@ -101,9 +101,9 @@
       "function": "json_group_merge",
       "scenario": "medium_groups",
       "size": "1k",
-      "min_ms": 4.98,
-      "median_ms": 5.36,
-      "max_ms": 5.69,
+      "min_ms": 5.07,
+      "median_ms": 5.24,
+      "max_ms": 5.67,
       "runs": 10
     },
     {
@@ -111,9 +111,9 @@
       "function": "json_group_merge",
       "scenario": "many_groups",
       "size": "1k",
-      "min_ms": 5.08,
-      "median_ms": 5.48,
-      "max_ms": 5.81,
+      "min_ms": 4.91,
+      "median_ms": 5.11,
+      "max_ms": 5.64,
       "runs": 10
     },
     {
@@ -121,9 +121,9 @@
       "function": "json_group_merge",
       "scenario": "ignore_nulls",
       "size": "1k",
-      "min_ms": 5.16,
-      "median_ms": 5.48,
-      "max_ms": 5.62,
+      "min_ms": 4.95,
+      "median_ms": 5.2,
+      "max_ms": 5.7,
       "runs": 10
     },
     {
@@ -131,9 +131,9 @@
       "function": "json_group_merge",
       "scenario": "delete_nulls",
       "size": "1k",
-      "min_ms": 5.03,
-      "median_ms": 5.28,
-      "max_ms": 5.47,
+      "min_ms": 4.76,
+      "median_ms": 5.15,
+      "max_ms": 5.42,
       "runs": 10
     },
     {
@@ -141,9 +141,9 @@
       "function": "json_flatten",
       "scenario": "basic",
       "size": "10k",
-      "min_ms": 23.75,
-      "median_ms": 24.64,
-      "max_ms": 25.63,
+      "min_ms": 23.42,
+      "median_ms": 24.03,
+      "max_ms": 25.9,
       "runs": 10
     },
     {
@@ -151,9 +151,9 @@
       "function": "json_add_prefix",
       "scenario": "basic",
       "size": "10k",
-      "min_ms": 24.12,
-      "median_ms": 24.49,
-      "max_ms": 24.63,
+      "min_ms": 23.37,
+      "median_ms": 23.77,
+      "max_ms": 23.99,
       "runs": 10
     },
     {
@@ -161,9 +161,9 @@
       "function": "json_extract_columns",
       "scenario": "etl_core",
       "size": "10k",
-      "min_ms": 19.48,
-      "median_ms": 20.18,
-      "max_ms": 32.47,
+      "min_ms": 17.07,
+      "median_ms": 17.46,
+      "max_ms": 17.78,
       "runs": 10
     },
     {
@@ -171,9 +171,9 @@
       "function": "json_extract_columns",
       "scenario": "etl_full",
       "size": "10k",
-      "min_ms": 31.93,
-      "median_ms": 32.55,
-      "max_ms": 33.28,
+      "min_ms": 28.16,
+      "median_ms": 28.32,
+      "max_ms": 28.82,
       "runs": 10
     },
     {
@@ -181,9 +181,9 @@
       "function": "json_extract_columns",
       "scenario": "prefix_buckets",
       "size": "10k",
-      "min_ms": 22.28,
-      "median_ms": 22.55,
-      "max_ms": 22.98,
+      "min_ms": 21.02,
+      "median_ms": 21.41,
+      "max_ms": 21.75,
       "runs": 10
     },
     {
@@ -191,9 +191,9 @@
       "function": "json_extract_columns",
       "scenario": "mixed_50",
       "size": "10k",
-      "min_ms": 45.53,
-      "median_ms": 46.23,
-      "max_ms": 47.24,
+      "min_ms": 43.04,
+      "median_ms": 43.23,
+      "max_ms": 44.02,
       "runs": 10
     },
     {
@@ -201,9 +201,9 @@
       "function": "json_group_merge",
       "scenario": "few_groups",
       "size": "10k",
-      "min_ms": 19.97,
-      "median_ms": 20.36,
-      "max_ms": 21.2,
+      "min_ms": 19.66,
+      "median_ms": 20.07,
+      "max_ms": 20.93,
       "runs": 10
     },
     {
@@ -211,9 +211,9 @@
       "function": "json_group_merge",
       "scenario": "medium_groups",
       "size": "10k",
-      "min_ms": 28.09,
-      "median_ms": 28.92,
-      "max_ms": 30.43,
+      "min_ms": 26.49,
+      "median_ms": 28.21,
+      "max_ms": 30.94,
       "runs": 10
     },
     {
@@ -221,9 +221,9 @@
       "function": "json_group_merge",
       "scenario": "many_groups",
       "size": "10k",
-      "min_ms": 44.36,
-      "median_ms": 45.9,
-      "max_ms": 55.32,
+      "min_ms": 44.2,
+      "median_ms": 44.65,
+      "max_ms": 49.48,
       "runs": 10
     },
     {
@@ -231,9 +231,9 @@
       "function": "json_group_merge",
       "scenario": "ignore_nulls",
       "size": "10k",
-      "min_ms": 27.82,
-      "median_ms": 28.83,
-      "max_ms": 30.95,
+      "min_ms": 27.37,
+      "median_ms": 27.98,
+      "max_ms": 28.64,
       "runs": 10
     },
     {
@@ -241,9 +241,9 @@
       "function": "json_group_merge",
       "scenario": "delete_nulls",
       "size": "10k",
-      "min_ms": 27.27,
-      "median_ms": 28.89,
-      "max_ms": 31.26,
+      "min_ms": 26.88,
+      "median_ms": 27.94,
+      "max_ms": 28.76,
       "runs": 10
     },
     {
@@ -251,9 +251,9 @@
       "function": "json_flatten",
       "scenario": "basic",
       "size": "100k",
-      "min_ms": 233.71,
-      "median_ms": 238.64,
-      "max_ms": 244.84,
+      "min_ms": 232.81,
+      "median_ms": 234.21,
+      "max_ms": 238.12,
       "runs": 10
     },
     {
@@ -261,9 +261,9 @@
       "function": "json_add_prefix",
       "scenario": "basic",
       "size": "100k",
-      "min_ms": 235.15,
-      "median_ms": 238.41,
-      "max_ms": 254.79,
+      "min_ms": 230.69,
+      "median_ms": 232.1,
+      "max_ms": 235.72,
       "runs": 10
     },
     {
@@ -271,9 +271,9 @@
       "function": "json_extract_columns",
       "scenario": "etl_core",
       "size": "100k",
-      "min_ms": 188.88,
-      "median_ms": 190.64,
-      "max_ms": 196.22,
+      "min_ms": 164.2,
+      "median_ms": 167.81,
+      "max_ms": 170.41,
       "runs": 10
     },
     {
@@ -281,9 +281,9 @@
       "function": "json_extract_columns",
       "scenario": "etl_full",
       "size": "100k",
-      "min_ms": 310.52,
-      "median_ms": 314.5,
-      "max_ms": 332.29,
+      "min_ms": 275.27,
+      "median_ms": 276.98,
+      "max_ms": 289.23,
       "runs": 10
     },
     {
@@ -291,9 +291,9 @@
       "function": "json_extract_columns",
       "scenario": "prefix_buckets",
       "size": "100k",
-      "min_ms": 216.2,
-      "median_ms": 219.34,
-      "max_ms": 219.99,
+      "min_ms": 207.9,
+      "median_ms": 208.63,
+      "max_ms": 215.42,
       "runs": 10
     },
     {
@@ -301,9 +301,9 @@
       "function": "json_extract_columns",
       "scenario": "mixed_50",
       "size": "100k",
-      "min_ms": 441.85,
-      "median_ms": 448.4,
-      "max_ms": 466.24,
+      "min_ms": 417.89,
+      "median_ms": 420.28,
+      "max_ms": 423.89,
       "runs": 10
     },
     {
@@ -311,9 +311,9 @@
       "function": "json_group_merge",
       "scenario": "few_groups",
       "size": "100k",
-      "min_ms": 189.82,
-      "median_ms": 194.46,
-      "max_ms": 195.46,
+      "min_ms": 187.96,
+      "median_ms": 189.92,
+      "max_ms": 202.31,
       "runs": 10
     },
     {
@@ -321,9 +321,9 @@
       "function": "json_group_merge",
       "scenario": "medium_groups",
       "size": "100k",
-      "min_ms": 220.39,
-      "median_ms": 225.6,
-      "max_ms": 232.39,
+      "min_ms": 215.35,
+      "median_ms": 219.83,
+      "max_ms": 232.04,
       "runs": 10
     },
     {
@@ -331,9 +331,9 @@
       "function": "json_group_merge",
       "scenario": "many_groups",
       "size": "100k",
-      "min_ms": 276.9,
-      "median_ms": 282.08,
-      "max_ms": 306.18,
+      "min_ms": 272.17,
+      "median_ms": 279.48,
+      "max_ms": 281.84,
       "runs": 10
     },
     {
@@ -341,9 +341,9 @@
       "function": "json_group_merge",
       "scenario": "ignore_nulls",
       "size": "100k",
-      "min_ms": 221.47,
-      "median_ms": 227.08,
-      "max_ms": 230.4,
+      "min_ms": 214.8,
+      "median_ms": 219.33,
+      "max_ms": 225.46,
       "runs": 10
     },
     {
@@ -351,9 +351,9 @@
       "function": "json_group_merge",
       "scenario": "delete_nulls",
       "size": "100k",
-      "min_ms": 223.87,
-      "median_ms": 228.39,
-      "max_ms": 230.87,
+      "min_ms": 216.31,
+      "median_ms": 219.01,
+      "max_ms": 226.0,
       "runs": 10
     }
   ]

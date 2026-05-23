@@ -1468,16 +1468,23 @@ struct ChunkedKeyMatchCache {
 struct JsonExtractColumnsLocalState : public FunctionLocalState {
 	JsonExtractColumnsLocalState(Allocator &allocator, idx_t column_count)
 	    : json_allocator(std::make_shared<JSONAllocator>(allocator)), buffers(column_count),
-	      has_match(column_count, false), use_bitset_cache(column_count <= 64), column_count(column_count) {
+	      col_fragments(column_count), use_bitset_cache(column_count <= 64), column_count(column_count) {
 		match_results.reserve(column_count);
+		for (auto &frags : col_fragments) {
+			frags.reserve(4); // typical multi-match arity is 2-3
+		}
 		if (!use_bitset_cache) {
 			chunked_cache.Init(column_count);
 		}
 	}
 
 	shared_ptr<JSONAllocator> json_allocator;
-	vector<string> buffers;
-	vector<bool> has_match;
+	vector<string> buffers; // reused only on multi-match concat path
+
+	// Per-row staging: yyjson_val* fragments per output column, in JSON iteration order.
+	// Deferring concatenation to end-of-row lets the single-match case skip the
+	// std::string buffer entirely (direct StringVector::AddString from yyjson).
+	vector<vector<yyjson_val *>> col_fragments;
 
 	// Cache for key→matches (≤64 patterns)
 	KeyMatchCache cache;
@@ -1493,6 +1500,32 @@ JsonExtractColumnsInitLocalState(ExpressionState &state, const BoundFunctionExpr
 	auto &context = state.GetContext();
 	auto column_count = bind_data->Cast<JsonExtractColumnsBindData>().column_names.size();
 	return make_uniq<JsonExtractColumnsLocalState>(BufferAllocator::Get(context), column_count);
+}
+
+// Single-match fast path: serialize one yyjson_val straight into the output
+// StringVector, skipping the std::string staging buffer entirely. For strings
+// this is one memcpy (into StringHeap); the multi-match path costs two
+// (yyjson → buffer, buffer → StringHeap).
+static string_t AddYyjsonValueToVector(Vector &target_vec, yyjson_val *val, yyjson_alc *alc) {
+	switch (yyjson_get_tag(val)) {
+	case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
+		return StringVector::AddString(target_vec, "null", 4);
+	case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
+		return StringVector::AddString(target_vec, "true", 4);
+	case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
+		return StringVector::AddString(target_vec, "false", 5);
+	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NOESC:
+	case YYJSON_TYPE_STR | YYJSON_SUBTYPE_NONE: {
+		auto str = duckdb_yyjson::yyjson_get_str(val);
+		auto len = duckdb_yyjson::yyjson_get_len(val);
+		return StringVector::AddString(target_vec, str, len);
+	}
+	default: {
+		idx_t len;
+		auto data = JSONCommon::WriteVal<yyjson_val>(val, alc, len);
+		return StringVector::AddString(target_vec, data, len);
+	}
+	}
 }
 
 static void AppendJsonValue(string &target, yyjson_val *val, yyjson_alc *alc) {
@@ -1693,10 +1726,9 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 			throw InvalidInputException("json_extract_columns: expected JSON object input");
 		}
 
-		for (auto &buffer : local_state.buffers) {
-			buffer.clear();
+		for (auto &frags : local_state.col_fragments) {
+			frags.clear();
 		}
-		std::fill(local_state.has_match.begin(), local_state.has_match.end(), false);
 
 		// Reset cache if storage is full
 		auto &cache = local_state.cache;
@@ -1759,18 +1791,13 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 					cache.TryInsert(set_idx, key_str, key_len, key_hash, match_bitset);
 				}
 
-				// Iterate set bits
+				// Iterate set bits — stash value for each matching column;
+				// concatenation deferred to end-of-row finalize loop.
 				uint64_t remaining = match_bitset;
 				while (remaining != 0) {
 					idx_t col_idx = CountTrailingZeros(remaining);
 					remaining &= (remaining - 1);
-
-					if (local_state.has_match[col_idx]) {
-						local_state.buffers[col_idx].append(separator_data_ptr, separator_len);
-					} else {
-						local_state.has_match[col_idx] = true;
-					}
-					AppendJsonValue(local_state.buffers[col_idx], value, alc);
+					local_state.col_fragments[col_idx].push_back(value);
 				}
 			} else {
 				// Fallback for > 64 columns: use chunked cache
@@ -1798,21 +1825,16 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 					match_chunks =
 					    chunked_cache.TryInsert(chunked_set_idx, key_str, key_len, key_hash, local_state.match_results);
 
-					// If cache insert failed, process directly from match_results
+					// If cache insert failed, stash fragments directly from match_results
 					if (!match_chunks) {
 						for (int col_idx : local_state.match_results) {
-							if (local_state.has_match[col_idx]) {
-								local_state.buffers[col_idx].append(separator_data_ptr, separator_len);
-							} else {
-								local_state.has_match[col_idx] = true;
-							}
-							AppendJsonValue(local_state.buffers[col_idx], value, alc);
+							local_state.col_fragments[col_idx].push_back(value);
 						}
 						continue;
 					}
 				}
 
-				// Iterate over chunks and their set bits
+				// Iterate over chunks and their set bits — stash fragments per column
 				for (idx_t chunk_idx = 0; chunk_idx < chunked_cache.chunks_per_entry; chunk_idx++) {
 					uint64_t remaining = match_chunks[chunk_idx];
 					idx_t base_col = chunk_idx * 64;
@@ -1820,25 +1842,34 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 						idx_t bit_idx = CountTrailingZeros(remaining);
 						remaining &= (remaining - 1);
 						idx_t col_idx = base_col + bit_idx;
-
-						if (local_state.has_match[col_idx]) {
-							local_state.buffers[col_idx].append(separator_data_ptr, separator_len);
-						} else {
-							local_state.has_match[col_idx] = true;
-						}
-						AppendJsonValue(local_state.buffers[col_idx], value, alc);
+						local_state.col_fragments[col_idx].push_back(value);
 					}
 				}
 			}
 		}
 
 		for (idx_t col_idx = 0; col_idx < column_count; col_idx++) {
-			if (!local_state.has_match[col_idx]) {
+			auto &frags = local_state.col_fragments[col_idx];
+			if (frags.empty()) {
 				child_validities[col_idx]->SetInvalid(row);
 				continue;
 			}
 			child_validities[col_idx]->SetValid(row);
-			child_data[col_idx][row] = StringVector::AddString(*children[col_idx], local_state.buffers[col_idx]);
+			if (frags.size() == 1) {
+				// Single-match fast path: skip the std::string staging buffer.
+				child_data[col_idx][row] = AddYyjsonValueToVector(*children[col_idx], frags[0], alc);
+			} else {
+				// Multi-match: concatenate fragments with separators in the per-column scratch buffer.
+				auto &buffer = local_state.buffers[col_idx];
+				buffer.clear();
+				for (idx_t i = 0; i < frags.size(); i++) {
+					if (i > 0) {
+						buffer.append(separator_data_ptr, separator_len);
+					}
+					AppendJsonValue(buffer, frags[i], alc);
+				}
+				child_data[col_idx][row] = StringVector::AddString(*children[col_idx], buffer);
+			}
 		}
 	}
 }
