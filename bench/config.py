@@ -16,78 +16,137 @@ SIZES = {
 DEFAULT_RUNS = 10
 DEFAULT_PROFILE_RUNS = 1
 DEFAULT_TOLERANCE_PCT = 5
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_MIN_EFFECT_MS = 5.0
 
-# Complexity distribution (must sum to 1.0)
-COMPLEXITY_WEIGHTS = {
-    1: 0.20,  # flat, no nesting
-    2: 0.35,  # 2 levels max
-    3: 0.25,  # 3 levels, arrays of objects
-    4: 0.15,  # 4 levels, nested arrays
-    5: 0.05,  # 5 levels, heavy nesting
+
+# ────────────────────────────────────────────────────────────────────────
+# Scenarios — built around the marketing-telemetry shape produced by
+# bench/generate_data.py. Patterns target real field groups (utm_*, page_*,
+# device_*, geo_*, ec_*, ga_*, custom_event_*, pixel ids).
+# ────────────────────────────────────────────────────────────────────────
+
+# Reusable pattern blocks
+_CORE_EXACT = {
+    "user_id": "^user_id$",
+    "event_name": "^event_name$",
+    "event_ts": "^event_ts$",
+    "session_id": "^session_id$",
+    "event_id": "^event_id$",
 }
 
-# Value pools
-STR_POOL = [f"value_{i}" for i in range(100)]
-NUM_POOL = list(range(1000))
-UNICODE_STRINGS = ["привет", "你好", "مرحبا", "🎉", "café", "naïve"]
-SPECIAL_KEYS = ["key.with.dots", "key with spaces", "key\"quoted\""]
-
-# Field counts per nesting level
-FIELDS_PER_LEVEL_MIN = 2
-FIELDS_PER_LEVEL_MAX = 5
-
-# Array sizes by complexity
-ARRAY_SIZES = {
-    3: (1, 5),   # min, max for complexity 3
-    4: (3, 10),  # min, max for complexity 4
-    5: (5, 15),  # min, max for complexity 5
+_UTM_EXACT = {
+    "utm_source": "^utm_source$",
+    "utm_medium": "^utm_medium$",
+    "utm_campaign": "^utm_campaign$",
+    "utm_content": "^utm_content$",
+    "utm_term": "^utm_term$",
 }
 
-# Probabilities
-UNICODE_VALUE_PROB = 0.05
-SPECIAL_KEY_PROB = 0.02
+_PAGE_EXACT = {
+    "page_url": "^page_url$",
+    "page_path": "^page_path$",
+    "page_title": "^page_title$",
+    "page_referrer": "^page_referrer$",
+}
+
+_DEVICE_EXACT = {
+    "device_type": "^device_type$",
+    "device_browser": "^device_browser$",
+    "device_os": "^device_os$",
+    "device_user_agent": "^device_user_agent$",
+    "device_language": "^device_language$",
+}
+
+_GEO_EXACT = {
+    "geo_country": "^geo_country$",
+    "geo_region": "^geo_region$",
+    "geo_city": "^geo_city$",
+}
+
+_EC_REGEX = {
+    "ec_revenue": "^ec_revenue$",
+    "ec_currency": "^ec_currency$",
+    "ec_item_ids": r"^ec_items\[\d+\]\.item_id$",
+    "ec_item_prices": r"^ec_items\[\d+\]\.price$",
+}
+
 
 SCENARIOS = [
+    # ─── json_flatten ───
     {"function": "json_flatten", "scenario": "basic"},
+
+    # ─── json_add_prefix ───
     {"function": "json_add_prefix", "scenario": "basic"},
+
+    # ─── json_extract_columns ───
+    # Smallest realistic ETL: pick 5 core columns (user_id, event_name, utm_source, page_url, country)
     {
-        # 5 patterns: 2 exact, 2 prefix, 1 suffix
         "function": "json_extract_columns",
-        "scenario": "few_patterns",
+        "scenario": "etl_core",
         "patterns": {
-            "s1": "^s1$",           # exact
-            "s2": "^s2$",           # exact
-            "all_strings": "^s",    # prefix
-            "all_numbers": "^n",    # prefix
-            "counts": r"_count$",   # suffix (fallback)
+            "user_id": "^user_id$",
+            "event_name": "^event_name$",
+            "utm_source": "^utm_source$",
+            "page_url": "^page_url$",
+            "geo_country": "^geo_country$",
         },
     },
+    # Full daily-ETL extraction: 25 exact fields covering core + utm + page + device + geo
     {
-        # 14 patterns: 5 exact, 4 prefix, 5 regex/suffix
         "function": "json_extract_columns",
-        "scenario": "medium_patterns",
+        "scenario": "etl_full",
+        "patterns": {**_CORE_EXACT, **_UTM_EXACT, **_PAGE_EXACT, **_DEVICE_EXACT, **_GEO_EXACT},
+    },
+    # Prefix bucketing: collapse each field group into a single newline-joined string
+    {
+        "function": "json_extract_columns",
+        "scenario": "prefix_buckets",
         "patterns": {
-            **{f"exact_s{i}": f"^s{i}$" for i in range(1, 6)},   # 5 exact
-            **{f"prefix_{c}": f"^{c}" for c in ["n", "o", "g", "a"]},  # 4 prefix
-            "nested_s": r"o1\.s\d+",   # regex
-            "nested_n": r"o1\.n\d+",   # regex
-            "any_nested": r"\.\w+$",   # regex
-            "ids": r"_id$",            # suffix
-            "counts": r"_count$",      # suffix
+            "utm_all": "^utm_",
+            "page_all": "^page_",
+            "device_all": "^device_",
+            "geo_all": "^geo_",
+            "ga_all": "^ga_",
+            "ec_all": "^ec_",
+            "custom_all": "^custom_event_",
         },
     },
+    # Power-user ETL: ~50 patterns mixing exact + prefix + regex (forces chunked-cache path)
     {
-        # 100 patterns: 40 exact, 30 prefix, 30 regex
         "function": "json_extract_columns",
-        "scenario": "many_patterns",
+        "scenario": "mixed_50",
         "patterns": {
-            **{f"exact_{i:02d}": f"^s{i}$" for i in range(1, 41)},      # 40 exact
-            **{f"prefix_{i:02d}": f"^p{i:02d}" for i in range(1, 31)},  # 30 prefix
-            **{f"regex_{i:02d}": f"r{i:02d}.*" for i in range(1, 31)},  # 30 regex
+            **_CORE_EXACT,
+            **_UTM_EXACT,
+            **_PAGE_EXACT,
+            **_DEVICE_EXACT,
+            **_GEO_EXACT,
+            "ga_client_id": "^ga_client_id$",
+            "ga_session_id": "^ga_session_id$",
+            "ga_user_pseudo_id": "^ga_user_pseudo_id$",
+            "fbp": "^fbp$",
+            "yandex_uid": "^yandex_uid$",
+            "ym_uid": "^ym_uid$",
+            "_ga_cookie": "^_ga$",
+            # Prefix matches (lit. 7 → 1-many keys each)
+            "any_utm": "^utm_",
+            "any_page": "^page_",
+            "any_device": "^device_",
+            "any_geo": "^geo_",
+            "any_ec": "^ec_",
+            "any_ga": "^ga_",
+            "any_custom": "^custom_event_",
+            # Regex matches (~5)
+            "ec_item_ids": r"^ec_items\[\d+\]\.item_id$",
+            "ec_item_prices": r"^ec_items\[\d+\]\.price$",
+            "ec_item_qtys": r"^ec_items\[\d+\]\.quantity$",
+            "version_fields": r"_version$",
+            "id_fields": r"_id$",
         },
     },
+
+    # ─── json_group_merge ───
     {"function": "json_group_merge", "scenario": "few_groups", "group_col": "g1e1", "merge_opts": ""},
     {"function": "json_group_merge", "scenario": "medium_groups", "group_col": "g1e3", "merge_opts": ""},
     {"function": "json_group_merge", "scenario": "many_groups", "group_col": "g1e4", "merge_opts": ""},

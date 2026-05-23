@@ -32,42 +32,42 @@ def create_connection() -> duckdb.DuckDBPyConnection:
 
 
 def build_query(scenario_config: dict, data_path: Path) -> str:
-    """Build benchmark query with result consumption wrapper.
+    """Build benchmark query that materializes the function output to a TEMP TABLE.
 
-    All queries are wrapped with sum(length(CAST(... AS VARCHAR))) to:
-    1. Force computation (anti-dead-code-elimination)
-    2. Minimize stdout size (single number instead of millions of rows)
+    CREATE OR REPLACE TEMP TABLE forces every row to be computed and written
+    to columnar storage — matching the production ETL pattern (rick/data does
+    CTAS / INSERT INTO frequently). This avoids the `CAST(struct AS VARCHAR)`
+    overhead that dominated the old `sum(length(...))` wrapper for
+    json_extract_columns (~43% of measured time was the cast, not the function).
     """
     table = f"read_parquet('{data_path}')"
 
     match scenario_config["function"]:
         case "json_flatten":
             return f"""
-                SELECT sum(length(CAST(json_flatten(json_nested, '.') AS VARCHAR)))
-                FROM {table}
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT json_flatten(json_nested, '.') AS r FROM {table}
             """
 
         case "json_add_prefix":
             return f"""
-                SELECT sum(length(CAST(json_add_prefix(json_flat, 'pfx_') AS VARCHAR)))
-                FROM {table}
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT json_add_prefix(json_flat, 'pfx_') AS r FROM {table}
             """
 
         case "json_extract_columns":
             patterns_json = json.dumps(scenario_config["patterns"]).replace("'", "''")
             return f"""
-                SELECT sum(length(CAST(json_extract_columns(json_flat, '{patterns_json}', '\\n') AS VARCHAR)))
-                FROM {table}
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT json_extract_columns(json_flat, '{patterns_json}', E'\\n') AS r FROM {table}
             """
 
         case "json_group_merge":
             return f"""
-                SELECT sum(length(CAST(result AS VARCHAR)))
-                FROM (
-                    SELECT json_group_merge(json_flat{scenario_config['merge_opts']}) as result
-                    FROM {table}
-                    GROUP BY {scenario_config['group_col']}
-                )
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT json_group_merge(json_flat{scenario_config['merge_opts']}) AS r
+                FROM {table}
+                GROUP BY {scenario_config['group_col']}
             """
 
         case _:

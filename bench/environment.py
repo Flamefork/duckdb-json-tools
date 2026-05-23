@@ -6,7 +6,7 @@ from pathlib import Path
 
 import duckdb
 
-from config import COMPLEXITY_WEIGHTS, EXTENSION_PATH
+from config import EXTENSION_PATH
 
 
 def get_git_commit() -> str:
@@ -98,6 +98,6 @@ def collect_environment(seed: int, sizes: list[str]) -> dict:
         "dataset": {
             "seed": seed,
             "sizes": sizes,
-            "complexity_weights": list(COMPLEXITY_WEIGHTS.values()),
+            "schema": "marketing_telemetry_v1",
         },
     }

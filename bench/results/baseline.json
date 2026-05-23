@@ -1,16 +1,16 @@
 {
-  "schema_version": 2,
-  "generated_at": "2026-01-28T19:27:17+00:00",
+  "schema_version": 3,
+  "generated_at": "2026-05-23T23:11:35+00:00",
   "environment": {
     "build_type": "release",
     "os": "Darwin",
     "arch": "arm64",
     "cpu_model": "Apple M2 Max",
     "cpu_cores": 12,
-    "duckdb_version": "v1.4.4",
-    "git_commit": "1234f2688dc720e5fc9ac3fddf33136dccc4e247",
+    "duckdb_version": "v1.5.3",
+    "git_commit": "55dd7ec5c1da64e32f9c83b62c8868df7328f4c2",
     "git_dirty": false,
-    "duckdb_python_package_version": "1.4.4",
+    "duckdb_python_package_version": "1.5.3",
     "dataset": {
       "seed": 42,
       "sizes": [
@@ -18,13 +18,7 @@
         "10k",
         "1k"
       ],
-      "complexity_weights": [
-        0.2,
-        0.35,
-        0.25,
-        0.15,
-        0.05
-      ]
+      "schema": "marketing_telemetry_v1"
     }
   },
   "config": {
@@ -37,9 +31,9 @@
       "function": "json_flatten",
       "scenario": "basic",
       "size": "1k",
-      "min_ms": 1.56,
-      "median_ms": 1.63,
-      "max_ms": 1.77,
+      "min_ms": 2.62,
+      "median_ms": 2.81,
+      "max_ms": 3.09,
       "runs": 10
     },
     {
@@ -47,39 +41,49 @@
       "function": "json_add_prefix",
       "scenario": "basic",
       "size": "1k",
-      "min_ms": 1.52,
-      "median_ms": 1.59,
-      "max_ms": 1.78,
+      "min_ms": 2.59,
+      "median_ms": 2.77,
+      "max_ms": 2.89,
       "runs": 10
     },
     {
-      "id": "json_extract_columns/1k/few_patterns",
+      "id": "json_extract_columns/1k/etl_core",
       "function": "json_extract_columns",
-      "scenario": "few_patterns",
+      "scenario": "etl_core",
       "size": "1k",
-      "min_ms": 1.39,
-      "median_ms": 1.43,
-      "max_ms": 1.77,
+      "min_ms": 2.09,
+      "median_ms": 2.4,
+      "max_ms": 2.54,
       "runs": 10
     },
     {
-      "id": "json_extract_columns/1k/medium_patterns",
+      "id": "json_extract_columns/1k/etl_full",
       "function": "json_extract_columns",
-      "scenario": "medium_patterns",
+      "scenario": "etl_full",
       "size": "1k",
-      "min_ms": 2.17,
-      "median_ms": 2.27,
-      "max_ms": 2.7,
+      "min_ms": 3.59,
+      "median_ms": 3.85,
+      "max_ms": 4.03,
       "runs": 10
     },
     {
-      "id": "json_extract_columns/1k/many_patterns",
+      "id": "json_extract_columns/1k/prefix_buckets",
       "function": "json_extract_columns",
-      "scenario": "many_patterns",
+      "scenario": "prefix_buckets",
       "size": "1k",
-      "min_ms": 3.84,
-      "median_ms": 3.9,
-      "max_ms": 4.37,
+      "min_ms": 2.53,
+      "median_ms": 2.65,
+      "max_ms": 2.89,
+      "runs": 10
+    },
+    {
+      "id": "json_extract_columns/1k/mixed_50",
+      "function": "json_extract_columns",
+      "scenario": "mixed_50",
+      "size": "1k",
+      "min_ms": 5.21,
+      "median_ms": 5.48,
+      "max_ms": 5.78,
       "runs": 10
     },
     {
@@ -87,9 +91,9 @@
       "function": "json_group_merge",
       "scenario": "few_groups",
       "size": "1k",
-      "min_ms": 2.35,
-      "median_ms": 2.42,
-      "max_ms": 2.72,
+      "min_ms": 2.58,
+      "median_ms": 2.78,
+      "max_ms": 2.93,
       "runs": 10
     },
     {
@@ -97,9 +101,9 @@
       "function": "json_group_merge",
       "scenario": "medium_groups",
       "size": "1k",
-      "min_ms": 3.94,
-      "median_ms": 4.05,
-      "max_ms": 4.22,
+      "min_ms": 4.98,
+      "median_ms": 5.36,
+      "max_ms": 5.69,
       "runs": 10
     },
     {
@@ -107,9 +111,9 @@
       "function": "json_group_merge",
       "scenario": "many_groups",
       "size": "1k",
-      "min_ms": 3.8,
-      "median_ms": 3.99,
-      "max_ms": 4.08,
+      "min_ms": 5.08,
+      "median_ms": 5.48,
+      "max_ms": 5.81,
       "runs": 10
     },
     {
@@ -117,9 +121,9 @@
       "function": "json_group_merge",
       "scenario": "ignore_nulls",
       "size": "1k",
-      "min_ms": 3.12,
-      "median_ms": 3.22,
-      "max_ms": 3.49,
+      "min_ms": 5.16,
+      "median_ms": 5.48,
+      "max_ms": 5.62,
       "runs": 10
     },
     {
@@ -127,9 +131,9 @@
       "function": "json_group_merge",
       "scenario": "delete_nulls",
       "size": "1k",
-      "min_ms": 3.77,
-      "median_ms": 4.03,
-      "max_ms": 4.22,
+      "min_ms": 5.03,
+      "median_ms": 5.28,
+      "max_ms": 5.47,
       "runs": 10
     },
     {
@@ -137,9 +141,9 @@
       "function": "json_flatten",
       "scenario": "basic",
       "size": "10k",
-      "min_ms": 14.39,
-      "median_ms": 14.46,
-      "max_ms": 14.98,
+      "min_ms": 23.75,
+      "median_ms": 24.64,
+      "max_ms": 25.63,
       "runs": 10
     },
     {
@@ -147,39 +151,49 @@
       "function": "json_add_prefix",
       "scenario": "basic",
       "size": "10k",
-      "min_ms": 13.72,
-      "median_ms": 13.88,
-      "max_ms": 14.3,
+      "min_ms": 24.12,
+      "median_ms": 24.49,
+      "max_ms": 24.63,
       "runs": 10
     },
     {
-      "id": "json_extract_columns/10k/few_patterns",
+      "id": "json_extract_columns/10k/etl_core",
       "function": "json_extract_columns",
-      "scenario": "few_patterns",
+      "scenario": "etl_core",
       "size": "10k",
-      "min_ms": 11.2,
-      "median_ms": 11.45,
-      "max_ms": 11.57,
+      "min_ms": 19.48,
+      "median_ms": 20.18,
+      "max_ms": 32.47,
       "runs": 10
     },
     {
-      "id": "json_extract_columns/10k/medium_patterns",
+      "id": "json_extract_columns/10k/etl_full",
       "function": "json_extract_columns",
-      "scenario": "medium_patterns",
+      "scenario": "etl_full",
       "size": "10k",
-      "min_ms": 19.69,
-      "median_ms": 19.92,
-      "max_ms": 20.32,
+      "min_ms": 31.93,
+      "median_ms": 32.55,
+      "max_ms": 33.28,
       "runs": 10
     },
     {
-      "id": "json_extract_columns/10k/many_patterns",
+      "id": "json_extract_columns/10k/prefix_buckets",
       "function": "json_extract_columns",
-      "scenario": "many_patterns",
+      "scenario": "prefix_buckets",
       "size": "10k",
-      "min_ms": 34.22,
-      "median_ms": 34.5,
-      "max_ms": 34.9,
+      "min_ms": 22.28,
+      "median_ms": 22.55,
+      "max_ms": 22.98,
+      "runs": 10
+    },
+    {
+      "id": "json_extract_columns/10k/mixed_50",
+      "function": "json_extract_columns",
+      "scenario": "mixed_50",
+      "size": "10k",
+      "min_ms": 45.53,
+      "median_ms": 46.23,
+      "max_ms": 47.24,
       "runs": 10
     },
     {
@@ -187,9 +201,9 @@
       "function": "json_group_merge",
       "scenario": "few_groups",
       "size": "10k",
-      "min_ms": 17.28,
-      "median_ms": 17.46,
-      "max_ms": 17.87,
+      "min_ms": 19.97,
+      "median_ms": 20.36,
+      "max_ms": 21.2,
       "runs": 10
     },
     {
@@ -197,9 +211,9 @@
       "function": "json_group_merge",
       "scenario": "medium_groups",
       "size": "10k",
-      "min_ms": 27.63,
-      "median_ms": 28.38,
-      "max_ms": 30.28,
+      "min_ms": 28.09,
+      "median_ms": 28.92,
+      "max_ms": 30.43,
       "runs": 10
     },
     {
@@ -207,9 +221,9 @@
       "function": "json_group_merge",
       "scenario": "many_groups",
       "size": "10k",
-      "min_ms": 37.16,
-      "median_ms": 38.05,
-      "max_ms": 39.82,
+      "min_ms": 44.36,
+      "median_ms": 45.9,
+      "max_ms": 55.32,
       "runs": 10
     },
     {
@@ -217,9 +231,9 @@
       "function": "json_group_merge",
       "scenario": "ignore_nulls",
       "size": "10k",
-      "min_ms": 18.26,
-      "median_ms": 18.62,
-      "max_ms": 18.97,
+      "min_ms": 27.82,
+      "median_ms": 28.83,
+      "max_ms": 30.95,
       "runs": 10
     },
     {
@@ -227,9 +241,9 @@
       "function": "json_group_merge",
       "scenario": "delete_nulls",
       "size": "10k",
-      "min_ms": 28.09,
-      "median_ms": 28.75,
-      "max_ms": 31.35,
+      "min_ms": 27.27,
+      "median_ms": 28.89,
+      "max_ms": 31.26,
       "runs": 10
     },
     {
@@ -237,9 +251,9 @@
       "function": "json_flatten",
       "scenario": "basic",
       "size": "100k",
-      "min_ms": 143.01,
-      "median_ms": 144.12,
-      "max_ms": 144.75,
+      "min_ms": 233.71,
+      "median_ms": 238.64,
+      "max_ms": 244.84,
       "runs": 10
     },
     {
@@ -247,39 +261,49 @@
       "function": "json_add_prefix",
       "scenario": "basic",
       "size": "100k",
-      "min_ms": 136.16,
-      "median_ms": 136.5,
-      "max_ms": 138.07,
+      "min_ms": 235.15,
+      "median_ms": 238.41,
+      "max_ms": 254.79,
       "runs": 10
     },
     {
-      "id": "json_extract_columns/100k/few_patterns",
+      "id": "json_extract_columns/100k/etl_core",
       "function": "json_extract_columns",
-      "scenario": "few_patterns",
+      "scenario": "etl_core",
       "size": "100k",
-      "min_ms": 111.53,
-      "median_ms": 112.69,
-      "max_ms": 113.39,
+      "min_ms": 188.88,
+      "median_ms": 190.64,
+      "max_ms": 196.22,
       "runs": 10
     },
     {
-      "id": "json_extract_columns/100k/medium_patterns",
+      "id": "json_extract_columns/100k/etl_full",
       "function": "json_extract_columns",
-      "scenario": "medium_patterns",
+      "scenario": "etl_full",
       "size": "100k",
-      "min_ms": 194.92,
-      "median_ms": 195.95,
-      "max_ms": 196.49,
+      "min_ms": 310.52,
+      "median_ms": 314.5,
+      "max_ms": 332.29,
       "runs": 10
     },
     {
-      "id": "json_extract_columns/100k/many_patterns",
+      "id": "json_extract_columns/100k/prefix_buckets",
       "function": "json_extract_columns",
-      "scenario": "many_patterns",
+      "scenario": "prefix_buckets",
       "size": "100k",
-      "min_ms": 342.01,
-      "median_ms": 344.27,
-      "max_ms": 364.51,
+      "min_ms": 216.2,
+      "median_ms": 219.34,
+      "max_ms": 219.99,
+      "runs": 10
+    },
+    {
+      "id": "json_extract_columns/100k/mixed_50",
+      "function": "json_extract_columns",
+      "scenario": "mixed_50",
+      "size": "100k",
+      "min_ms": 441.85,
+      "median_ms": 448.4,
+      "max_ms": 466.24,
       "runs": 10
     },
     {
@@ -287,9 +311,9 @@
       "function": "json_group_merge",
       "scenario": "few_groups",
       "size": "100k",
-      "min_ms": 169.51,
-      "median_ms": 170.02,
-      "max_ms": 171.25,
+      "min_ms": 189.82,
+      "median_ms": 194.46,
+      "max_ms": 195.46,
       "runs": 10
     },
     {
@@ -297,9 +321,9 @@
       "function": "json_group_merge",
       "scenario": "medium_groups",
       "size": "100k",
-      "min_ms": 212.73,
-      "median_ms": 213.59,
-      "max_ms": 218.71,
+      "min_ms": 220.39,
+      "median_ms": 225.6,
+      "max_ms": 232.39,
       "runs": 10
     },
     {
@@ -307,9 +331,9 @@
       "function": "json_group_merge",
       "scenario": "many_groups",
       "size": "100k",
-      "min_ms": 298.13,
-      "median_ms": 300.12,
-      "max_ms": 313.23,
+      "min_ms": 276.9,
+      "median_ms": 282.08,
+      "max_ms": 306.18,
       "runs": 10
     },
     {
@@ -317,9 +341,9 @@
       "function": "json_group_merge",
       "scenario": "ignore_nulls",
       "size": "100k",
-      "min_ms": 139.48,
-      "median_ms": 140.0,
-      "max_ms": 144.18,
+      "min_ms": 221.47,
+      "median_ms": 227.08,
+      "max_ms": 230.4,
       "runs": 10
     },
     {
@@ -327,9 +351,9 @@
       "function": "json_group_merge",
       "scenario": "delete_nulls",
       "size": "100k",
-      "min_ms": 212.42,
-      "median_ms": 214.54,
-      "max_ms": 220.96,
+      "min_ms": 223.87,
+      "median_ms": 228.39,
+      "max_ms": 230.87,
       "runs": 10
     }
   ]
