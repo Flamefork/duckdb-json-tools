@@ -1566,10 +1566,11 @@ JsonExtractColumnsInitLocalState(ExpressionState &state, const BoundFunctionExpr
 // StringVector, skipping the std::string staging buffer entirely. For strings
 // this is one memcpy (into StringHeap); the multi-match path costs two
 // (yyjson → buffer, buffer → StringHeap).
+// JSON null must be filtered out by the caller — it maps to SQL NULL via the
+// validity mask, not to the literal string "null".
 static string_t AddYyjsonValueToVector(Vector &target_vec, yyjson_val *val, yyjson_alc *alc) {
+	D_ASSERT(!yyjson_is_null(val));
 	switch (yyjson_get_tag(val)) {
-	case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
-		return StringVector::AddString(target_vec, "null", 4);
 	case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
 		return StringVector::AddString(target_vec, "true", 4);
 	case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_FALSE:
@@ -1588,11 +1589,12 @@ static string_t AddYyjsonValueToVector(Vector &target_vec, yyjson_val *val, yyjs
 	}
 }
 
+// Same JSON-null contract as AddYyjsonValueToVector — null fragments are
+// dropped by the caller so the literal "null" doesn't collide with the
+// string "null".
 static void AppendJsonValue(string &target, yyjson_val *val, yyjson_alc *alc) {
+	D_ASSERT(!yyjson_is_null(val));
 	switch (yyjson_get_tag(val)) {
-	case YYJSON_TYPE_NULL | YYJSON_SUBTYPE_NONE:
-		target.append("null");
-		break;
 	case YYJSON_TYPE_BOOL | YYJSON_SUBTYPE_TRUE:
 		target.append("true");
 		break;
@@ -1754,7 +1756,7 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 			for (idx_t col_idx = 0; col_idx < column_count; col_idx++) {
 				const auto &key_name = bind_data.trivial_keys[col_idx];
 				auto val = duckdb_yyjson::yyjson_obj_getn(root, key_name.data(), key_name.size());
-				if (!val) {
+				if (!val || yyjson_is_null(val)) {
 					child_validities[col_idx]->SetInvalid(row);
 					continue;
 				}
@@ -1866,11 +1868,18 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 				throw InvalidInputException("json_extract_columns: encountered non-string object key");
 			}
 
+			auto value = yyjson_obj_iter_get_val(key);
+			// JSON null contributes nothing observable: a single match collapses
+			// to SQL NULL in finalize, multiple matches drop it from the concat.
+			// Skipping early also saves the cache lookup, regex match, and bitset
+			// bookkeeping for this key.
+			if (yyjson_is_null(value)) {
+				continue;
+			}
+
 			// Hash the key for cache lookup
 			uint64_t key_hash = HashKeyBytes(key_str, key_len);
 			idx_t set_idx = (key_hash & (KEY_MATCH_CACHE_SETS - 1)) * KEY_MATCH_CACHE_WAYS;
-
-			auto value = yyjson_obj_iter_get_val(key);
 
 			if (use_bitset) {
 				// Fast path for ≤64 columns: use cache with bitset
