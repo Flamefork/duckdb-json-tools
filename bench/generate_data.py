@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Generate realistic marketing-telemetry-shaped JSON events for benchmarks.
+"""Generate realistic marketing-telemetry JSON events for benchmarks.
 
-Each row models a single web/app tracking event in the style of Segment,
-GA4, or Snowplow payloads: a mix of attribution (utm_*), page context,
-device fingerprint, geo, pixel ids, ecommerce, and sparse custom params.
+v2 — event archetypes for schema-stable data.
+
+Real marketing data is **schema-clustered**: each `event_name` produces a
+consistent key set across millions of rows (a `purchase` always has
+ec_revenue, a `page_view` never does). The previous generator rolled
+optional groups independently per row, producing ~39k distinct schemas in
+100k rows — wildly unrealistic and breaking any schema-aware analysis.
+
+v2 picks one of ~14 fixed archetypes per row; required groups are always
+present, optional fields vary only at the leaf level. Target: 10-30
+distinct schemas across the whole dataset, ~50-80 keys per row.
 """
 import argparse
 import json
@@ -17,7 +25,7 @@ from config import DATA_DIR, SIZES
 
 
 # ────────────────────────────────────────────────────────────────────────
-# Value pools (realistic but bounded for repeatability)
+# Value pools
 # ────────────────────────────────────────────────────────────────────────
 
 UTM_SOURCES = ["google", "facebook", "instagram", "yandex", "vk", "tiktok",
@@ -31,9 +39,9 @@ UTM_CAMPAIGNS = [f"{theme}_{year}_{i:02d}"
                  for year in ["2023", "2024", "2025"]
                  for i in range(1, 6)]
 UTM_CONTENTS = ["banner_top", "banner_side", "card_a", "card_b", "video_pre",
-                "email_cta", "popup", "footer_link", "menu_promo", None]
+                "email_cta", "popup", "footer_link", "menu_promo"]
 UTM_TERMS = ["buy_shoes", "best_laptop", "cheap_flights", "ai_tools",
-             "online_course", "summer_dress", None, None, None]
+             "online_course", "summer_dress"]
 
 DOMAINS = ["example.com", "shop.example.com", "blog.example.com",
            "promo.partner.com", "app.startup.io"]
@@ -44,11 +52,10 @@ PAGE_TITLES = ["Home – Example Store", "All Products", "Running Shoes – Best
                "Laptops Under $1000", "Your Cart", "Secure Checkout",
                "SEO Tips for 2025", "About Us", "Contact Support",
                "My Account", "Order History"]
-REFERRERS = [None, None, None,
-             "https://www.google.com/search?q=shoes",
-             "https://www.google.com/", "https://yandex.ru/",
-             "https://m.facebook.com/", "https://t.me/somechannel",
-             "https://news.ycombinator.com/", "https://twitter.com/"]
+REFERRERS = ["https://www.google.com/search?q=shoes", "https://www.google.com/",
+             "https://yandex.ru/", "https://m.facebook.com/",
+             "https://t.me/somechannel", "https://news.ycombinator.com/",
+             "https://twitter.com/"]
 
 DEVICE_TYPES = ["mobile", "desktop", "tablet"]
 BROWSERS = ["Chrome", "Safari", "Firefox", "Edge", "Yandex", "Opera"]
@@ -74,76 +81,27 @@ CITIES = {"California": ["San Francisco", "Los Angeles", "San Jose"],
           "New York": ["New York City", "Buffalo"], "Moscow": ["Moscow"],
           "Berlin": ["Berlin"], "Tokyo": ["Tokyo"]}
 
-EVENT_NAMES = ["page_view", "click", "scroll", "form_submit", "purchase",
-               "add_to_cart", "remove_from_cart", "view_item", "sign_up",
-               "login", "search", "share", "video_play", "video_complete"]
 CURRENCIES = ["USD", "EUR", "RUB", "JPY", "BRL", "GBP"]
-
-CUSTOM_KEYS = ["button_text", "form_id", "experiment_variant", "ab_test",
-               "section_id", "video_id", "video_position", "search_query",
-               "filter_applied", "sort_order", "page_depth", "scroll_pct"]
-
-PIXEL_IDS = {
-    "fbp": lambda r: f"fb.1.{r.randint(1_000_000_000, 9_999_999_999)}.{r.randint(100, 999)}",
-    "yandex_uid": lambda r: str(r.randint(1_000_000_000, 9_999_999_999)),
-    "ym_uid": lambda r: str(r.randint(1_000_000_000, 9_999_999_999)),
-    "_ga": lambda r: f"GA1.2.{r.randint(100_000_000, 999_999_999)}.{r.randint(1_000_000_000, 9_999_999_999)}",
-}
 
 ITEM_NAMES = ["Running Shoes", "Wireless Headphones", "Laptop Stand",
               "Coffee Mug", "Notebook", "USB Cable", "T-Shirt", "Jeans",
               "Sunglasses", "Backpack"]
 
+LOGIN_METHODS = ["email", "google_oauth", "apple_id", "facebook", "phone_otp"]
+SIGNUP_METHODS = ["email", "google_oauth", "apple_id", "phone_otp"]
+SHARE_CHANNELS = ["facebook", "twitter", "telegram", "whatsapp", "copy_link", "email"]
+SEARCH_QUERIES = ["running shoes", "laptop", "summer dress", "wireless headphones",
+                  "coffee mug", "back to school", "cheap flights"]
+
 
 # ────────────────────────────────────────────────────────────────────────
-# Field-group probabilities (per event)
+# Field-group generators — each emits a dict of keys for one group.
 # ────────────────────────────────────────────────────────────────────────
-
-P_UTM = 0.70          # has any utm_* fields
-P_UTM_CONTENT = 0.40  # within utm-having events, has utm_content
-P_UTM_TERM = 0.30
-P_PAGE = 0.80         # has page_*
-P_REFERRER = 0.55     # within page-having
-P_DEVICE = 0.95
-P_GEO = 0.90
-P_GEO_REGION = 0.75   # geo+region
-P_GEO_CITY = 0.60
-P_GA = 0.60
-P_EC = 0.15           # event is ecommerce
-P_EC_ITEMS = 0.80     # within ec events, has line items
-P_CUSTOM = 0.30
-N_CUSTOM_MIN = 3      # custom field count when present
-N_CUSTOM_MAX = 8
-P_PIXEL = 0.40        # has any pixel ids
-N_PIXEL_MIN = 1
-N_PIXEL_MAX = 3
-
-
-def event_id(seed: int, row_idx: int) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{seed}:event:{row_idx}"))
-
-
-def user_id_for(seed: int, row_idx: int) -> str:
-    # Cluster users: ~100K distinct users across data, repeated visits
-    user_bucket = row_idx % max(1, 1 + row_idx // 5)
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{seed}:user:{user_bucket}"))
-
-
-def session_id_for(seed: int, row_idx: int) -> str:
-    session_bucket = row_idx // 5  # ~5 events per session
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{seed}:session:{session_bucket}"))
-
-
-def make_rng(seed: int, row_idx: int) -> random.Random:
-    return random.Random(f"{seed}:{row_idx}")
-
 
 def make_page_url(rng: random.Random, path: str) -> str:
-    """Build a realistic-looking page_url with query string sometimes."""
     domain = rng.choice(DOMAINS)
     qs = ""
     if rng.random() < 0.40:
-        # Add some tracking params to query string
         params = []
         if rng.random() < 0.7:
             params.append(f"utm_source={rng.choice(UTM_SOURCES)}")
@@ -156,115 +114,255 @@ def make_page_url(rng: random.Random, path: str) -> str:
     return f"https://{domain}{path}{qs}"
 
 
+def grp_core(rng: random.Random, seed: int, row_idx: int) -> dict:
+    return {
+        "event_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{seed}:event:{row_idx}")),
+        "event_ts": 1_716_000_000 + rng.randint(0, 2_592_000),
+        "user_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{seed}:user:{row_idx // 5}")),
+        "session_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{seed}:session:{row_idx // 5}")),
+    }
+
+
+def grp_utm(rng: random.Random) -> dict:
+    return {
+        "utm_source": rng.choice(UTM_SOURCES),
+        "utm_medium": rng.choice(UTM_MEDIUMS),
+        "utm_campaign": rng.choice(UTM_CAMPAIGNS),
+        "utm_content": rng.choice(UTM_CONTENTS),
+        "utm_term": rng.choice(UTM_TERMS),
+    }
+
+
+def grp_page(rng: random.Random) -> dict:
+    path = rng.choice(PAGE_PATHS)
+    return {
+        "page_url": make_page_url(rng, path),
+        "page_path": path,
+        "page_title": rng.choice(PAGE_TITLES),
+        "page_referrer": rng.choice(REFERRERS),
+    }
+
+
+def grp_device(rng: random.Random) -> dict:
+    return {
+        "device_type": rng.choice(DEVICE_TYPES),
+        "device_browser": rng.choice(BROWSERS),
+        "device_browser_version": f"{rng.randint(80, 125)}.0",
+        "device_os": rng.choice(OSES),
+        "device_os_version": f"{rng.randint(10, 17)}.{rng.randint(0, 5)}",
+        "device_user_agent": rng.choice(UA_TEMPLATES),
+        "device_screen": rng.choice(SCREENS),
+        "device_language": rng.choice(LANGUAGES),
+    }
+
+
+def grp_geo(rng: random.Random) -> dict:
+    country = rng.choice(COUNTRIES)
+    region = rng.choice(REGIONS.get(country, ["Unknown"]))
+    city = rng.choice(CITIES.get(region, ["Unknown"]))
+    return {
+        "geo_country": country,
+        "geo_region": region,
+        "geo_city": city,
+    }
+
+
+def grp_ga(rng: random.Random) -> dict:
+    return {
+        "ga_client_id": f"{rng.randint(1_000_000_000, 9_999_999_999)}.{rng.randint(1_000_000_000, 9_999_999_999)}",
+        "ga_session_id": str(rng.randint(1_700_000_000, 1_750_000_000)),
+        "ga_user_pseudo_id": str(rng.randint(1_000_000_000, 9_999_999_999)),
+    }
+
+
+def grp_pixels(rng: random.Random) -> dict:
+    return {
+        "fbp": f"fb.1.{rng.randint(1_000_000_000, 9_999_999_999)}.{rng.randint(100, 999)}",
+        "yandex_uid": str(rng.randint(1_000_000_000, 9_999_999_999)),
+        "ym_uid": str(rng.randint(1_000_000_000, 9_999_999_999)),
+        "_ga": f"GA1.2.{rng.randint(100_000_000, 999_999_999)}.{rng.randint(1_000_000_000, 9_999_999_999)}",
+    }
+
+
+def grp_ec(rng: random.Random) -> dict:
+    return {
+        "ec_currency": rng.choice(CURRENCIES),
+        "ec_revenue": round(rng.uniform(5, 500), 2),
+        "ec_transaction_id": f"txn_{rng.randint(100000, 999999)}",
+        "ec_tax": round(rng.uniform(0, 50), 2),
+        "ec_shipping": round(rng.uniform(0, 30), 2),
+    }
+
+
+def grp_ec_items(rng: random.Random, n_items: int) -> dict:
+    return {
+        "ec_items": [
+            {
+                "item_id": f"sku_{rng.randint(1000, 9999)}",
+                "item_name": rng.choice(ITEM_NAMES),
+                "price": round(rng.uniform(5, 200), 2),
+                "quantity": rng.randint(1, 3),
+            }
+            for _ in range(n_items)
+        ]
+    }
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Event archetypes — each maps event_name → (weight, [field-groups], [extras])
+# Within an archetype the present key SET is fixed; only leaf values vary.
+# ────────────────────────────────────────────────────────────────────────
+
+def custom_extras(rng: random.Random, keys: list[str]) -> dict:
+    """Emit a fixed set of custom_event_* keys for an archetype."""
+    out = {}
+    for k in keys:
+        if k in ("video_position", "page_depth", "scroll_pct"):
+            out[f"custom_event_{k}"] = rng.randint(0, 100)
+        else:
+            out[f"custom_event_{k}"] = f"val_{rng.randint(0, 100)}"
+    return out
+
+
+# (weight, base_groups, extras_fn or None)
+ARCHETYPES = {
+    "page_view": (
+        45,
+        ["core", "utm", "page", "device", "geo", "ga", "pixels"],
+        None,
+    ),
+    "click": (
+        15,
+        ["core", "utm", "page", "device", "geo", "ga"],
+        lambda rng: custom_extras(rng, ["button_text", "section_id", "element_id"]),
+    ),
+    "scroll": (
+        8,
+        ["core", "page", "device", "geo"],
+        lambda rng: custom_extras(rng, ["scroll_pct", "page_depth"]),
+    ),
+    "form_submit": (
+        4,
+        ["core", "utm", "page", "device", "geo", "ga"],
+        lambda rng: custom_extras(rng, ["form_id", "form_step", "form_type"]),
+    ),
+    "purchase": (
+        4,
+        ["core", "utm", "page", "device", "geo", "ga", "ec", "ec_items", "pixels"],
+        None,
+    ),
+    "add_to_cart": (
+        6,
+        ["core", "utm", "page", "device", "geo", "ga"],
+        lambda rng: {
+            "ec_item_id": f"sku_{rng.randint(1000, 9999)}",
+            "ec_item_name": rng.choice(ITEM_NAMES),
+            "ec_item_price": round(rng.uniform(5, 200), 2),
+            "ec_currency": rng.choice(CURRENCIES),
+        },
+    ),
+    "view_item": (
+        5,
+        ["core", "utm", "page", "device", "geo", "ga"],
+        lambda rng: {
+            "ec_item_id": f"sku_{rng.randint(1000, 9999)}",
+            "ec_item_name": rng.choice(ITEM_NAMES),
+            "ec_item_price": round(rng.uniform(5, 200), 2),
+        },
+    ),
+    "sign_up": (
+        2,
+        ["core", "utm", "page", "device", "geo"],
+        lambda rng: custom_extras(rng, ["signup_method"]) | {
+            "custom_event_signup_method": rng.choice(SIGNUP_METHODS),
+        },
+    ),
+    "login": (
+        3,
+        ["core", "page", "device", "geo"],
+        lambda rng: {
+            "custom_event_login_method": rng.choice(LOGIN_METHODS),
+        },
+    ),
+    "search": (
+        4,
+        ["core", "page", "device", "geo"],
+        lambda rng: {
+            "custom_event_search_query": rng.choice(SEARCH_QUERIES),
+            "custom_event_filter_applied": f"val_{rng.randint(0, 20)}",
+            "custom_event_sort_order": rng.choice(["relevance", "price_asc", "price_desc", "newest"]),
+        },
+    ),
+    "share": (
+        2,
+        ["core", "page", "device"],
+        lambda rng: {
+            "custom_event_share_channel": rng.choice(SHARE_CHANNELS),
+            "custom_event_content_id": f"content_{rng.randint(100, 9999)}",
+        },
+    ),
+    "video_play": (
+        1,
+        ["core", "page", "device", "geo"],
+        lambda rng: {
+            "custom_event_video_id": f"video_{rng.randint(100, 999)}",
+            "custom_event_video_position": rng.randint(0, 600),
+            "custom_event_video_duration": rng.randint(60, 1800),
+        },
+    ),
+    "video_complete": (
+        1,
+        ["core", "page", "device", "geo"],
+        lambda rng: {
+            "custom_event_video_id": f"video_{rng.randint(100, 999)}",
+            "custom_event_video_duration": rng.randint(60, 1800),
+        },
+    ),
+}
+
+
+GROUP_GENERATORS = {
+    "core": grp_core,
+    "utm": lambda rng, *_: grp_utm(rng),
+    "page": lambda rng, *_: grp_page(rng),
+    "device": lambda rng, *_: grp_device(rng),
+    "geo": lambda rng, *_: grp_geo(rng),
+    "ga": lambda rng, *_: grp_ga(rng),
+    "pixels": lambda rng, *_: grp_pixels(rng),
+    "ec": lambda rng, *_: grp_ec(rng),
+    "ec_items": lambda rng, *_: grp_ec_items(rng, n_items=2),
+}
+
+
+# Pre-build cumulative weights for archetype selection
+_ARCHETYPE_NAMES = list(ARCHETYPES.keys())
+_ARCHETYPE_WEIGHTS = [ARCHETYPES[n][0] for n in _ARCHETYPE_NAMES]
+
+
+def make_rng(seed: int, row_idx: int) -> random.Random:
+    return random.Random(f"{seed}:{row_idx}")
+
+
 def generate_event(seed: int, row_idx: int) -> dict:
-    """Generate a single realistic web telemetry event."""
     rng = make_rng(seed, row_idx)
-    e: dict = {}
+    archetype = rng.choices(_ARCHETYPE_NAMES, weights=_ARCHETYPE_WEIGHTS, k=1)[0]
+    _, base_groups, extras_fn = ARCHETYPES[archetype]
 
-    # Core (always present)
-    e["event_id"] = event_id(seed, row_idx)
-    e["event_name"] = rng.choice(EVENT_NAMES)
-    # Spread timestamps over ~30 days
-    e["event_ts"] = 1_716_000_000 + rng.randint(0, 2_592_000)
-    e["user_id"] = user_id_for(seed, row_idx)
-    e["session_id"] = session_id_for(seed, row_idx)
+    e: dict = {"event_name": archetype}
+    for grp in base_groups:
+        gen = GROUP_GENERATORS[grp]
+        if grp == "core":
+            e.update(gen(rng, seed, row_idx))
+        else:
+            e.update(gen(rng))
 
-    # UTM
-    if rng.random() < P_UTM:
-        e["utm_source"] = rng.choice(UTM_SOURCES)
-        e["utm_medium"] = rng.choice(UTM_MEDIUMS)
-        e["utm_campaign"] = rng.choice(UTM_CAMPAIGNS)
-        if rng.random() < P_UTM_CONTENT:
-            v = rng.choice(UTM_CONTENTS)
-            if v is not None:
-                e["utm_content"] = v
-        if rng.random() < P_UTM_TERM:
-            v = rng.choice(UTM_TERMS)
-            if v is not None:
-                e["utm_term"] = v
-
-    # Page
-    if rng.random() < P_PAGE:
-        path = rng.choice(PAGE_PATHS)
-        e["page_url"] = make_page_url(rng, path)
-        e["page_path"] = path
-        e["page_title"] = rng.choice(PAGE_TITLES)
-        if rng.random() < P_REFERRER:
-            v = rng.choice(REFERRERS)
-            if v is not None:
-                e["page_referrer"] = v
-
-    # Device
-    if rng.random() < P_DEVICE:
-        e["device_type"] = rng.choice(DEVICE_TYPES)
-        e["device_browser"] = rng.choice(BROWSERS)
-        e["device_browser_version"] = f"{rng.randint(80, 125)}.0"
-        e["device_os"] = rng.choice(OSES)
-        e["device_os_version"] = f"{rng.randint(10, 17)}.{rng.randint(0, 5)}"
-        e["device_user_agent"] = rng.choice(UA_TEMPLATES)
-        e["device_screen"] = rng.choice(SCREENS)
-        e["device_language"] = rng.choice(LANGUAGES)
-
-    # Geo
-    if rng.random() < P_GEO:
-        country = rng.choice(COUNTRIES)
-        e["geo_country"] = country
-        if rng.random() < P_GEO_REGION and country in REGIONS:
-            region = rng.choice(REGIONS[country])
-            e["geo_region"] = region
-            if rng.random() < P_GEO_CITY and region in CITIES:
-                e["geo_city"] = rng.choice(CITIES[region])
-
-    # GA pixels
-    if rng.random() < P_GA:
-        e["ga_client_id"] = f"{rng.randint(1_000_000_000, 9_999_999_999)}.{rng.randint(1_000_000_000, 9_999_999_999)}"
-        e["ga_session_id"] = str(rng.randint(1_700_000_000, 1_750_000_000))
-        if rng.random() < 0.6:
-            e["ga_user_pseudo_id"] = str(rng.randint(1_000_000_000, 9_999_999_999))
-
-    # Ecommerce (sparse)
-    if rng.random() < P_EC:
-        e["ec_currency"] = rng.choice(CURRENCIES)
-        e["ec_revenue"] = round(rng.uniform(5, 500), 2)
-        e["ec_transaction_id"] = f"txn_{rng.randint(100000, 999999)}"
-        if rng.random() < P_EC_ITEMS:
-            n_items = rng.randint(1, 4)
-            e["ec_items"] = [
-                {
-                    "item_id": f"sku_{rng.randint(1000, 9999)}",
-                    "item_name": rng.choice(ITEM_NAMES),
-                    "price": round(rng.uniform(5, 200), 2),
-                    "quantity": rng.randint(1, 3),
-                }
-                for _ in range(n_items)
-            ]
-
-    # Custom event params (sparse, varying field set)
-    if rng.random() < P_CUSTOM:
-        n_custom = rng.randint(N_CUSTOM_MIN, N_CUSTOM_MAX)
-        for k in rng.sample(CUSTOM_KEYS, k=min(n_custom, len(CUSTOM_KEYS))):
-            if k in ("video_position", "page_depth", "scroll_pct"):
-                e[f"custom_event_{k}"] = rng.randint(0, 100)
-            else:
-                e[f"custom_event_{k}"] = f"val_{rng.randint(0, 50)}"
-
-    # Pixel ids
-    if rng.random() < P_PIXEL:
-        n_pix = rng.randint(N_PIXEL_MIN, min(N_PIXEL_MAX, len(PIXEL_IDS)))
-        for pix_key in rng.sample(list(PIXEL_IDS.keys()), k=n_pix):
-            e[pix_key] = PIXEL_IDS[pix_key](rng)
+    if extras_fn is not None:
+        e.update(extras_fn(rng))
 
     return e
 
 
 def flatten_event(event: dict) -> dict:
-    """Flatten one level of nesting (ec_items[i].*, user_properties.*).
-
-    Top-level keys stay as-is; nested objects/arrays get path keys with
-    bracket-index for arrays and dot for object members. Mirrors how
-    json_extract_columns is fed in production (typically already-flattened
-    payloads or one-level-nested ones).
-    """
     out: dict = {}
     for k, v in event.items():
         if isinstance(v, dict):
@@ -288,7 +386,6 @@ def generate_row(row_idx: int, seed: int) -> dict:
     return {
         "json_nested": json.dumps(event, separators=(",", ":")),
         "json_flat": json.dumps(flat, separators=(",", ":")),
-        # Group keys for json_group_merge: vary cardinality from 10 to 10k
         "g1e1": f"g_{row_idx % 10}",
         "g1e3": f"g_{row_idx % 1000}",
         "g1e4": f"g_{row_idx % 10000}",
@@ -346,7 +443,7 @@ def generate_data(size_name: str, num_rows: int, seed: int) -> None:
                 size: '{size_name}',
                 rows: '{num_rows}',
                 generated_at: '{generated_at}',
-                schema_version: 'marketing_telemetry_v1'
+                schema_version: 'marketing_telemetry_v2_archetypes'
             }}
         )
         """
@@ -357,18 +454,11 @@ def generate_data(size_name: str, num_rows: int, seed: int) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate marketing-telemetry benchmark data")
-    parser.add_argument(
-        "--size",
-        choices=list(SIZES.keys()),
-        help="Generate only this size (default: all)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for deterministic generation (default: 42)",
-    )
+    parser = argparse.ArgumentParser(description="Generate marketing-telemetry benchmark data (v2)")
+    parser.add_argument("--size", choices=list(SIZES.keys()),
+                        help="Generate only this size (default: all)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed (default: 42)")
     args = parser.parse_args()
 
     if args.size:

@@ -16,7 +16,7 @@ SIZES = {
 DEFAULT_RUNS = 10
 DEFAULT_PROFILE_RUNS = 1
 DEFAULT_TOLERANCE_PCT = 5
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_MIN_EFFECT_MS = 5.0
 
 
@@ -80,7 +80,7 @@ SCENARIOS = [
     {"function": "json_add_prefix", "scenario": "basic"},
 
     # ─── json_extract_columns ───
-    # Smallest realistic ETL: pick 5 core columns (user_id, event_name, utm_source, page_url, country)
+    # Smallest realistic ETL: pick 5 core columns
     {
         "function": "json_extract_columns",
         "scenario": "etl_core",
@@ -92,11 +92,51 @@ SCENARIOS = [
             "geo_country": "^geo_country$",
         },
     },
+    # K-crossover sweep: 8 exact patterns (just below current trivial cap K≤12).
+    # Used to confirm trivial-mode threshold on realistic shape.
+    {
+        "function": "json_extract_columns",
+        "scenario": "etl_k8",
+        "patterns": {
+            **_CORE_EXACT,
+            "utm_source": "^utm_source$",
+            "utm_campaign": "^utm_campaign$",
+            "page_url": "^page_url$",
+        },
+    },
+    # K=16 — above current trivial cap (12), confirms general-path baseline.
+    {
+        "function": "json_extract_columns",
+        "scenario": "etl_k16",
+        "patterns": {
+            **_CORE_EXACT,
+            **_UTM_EXACT,
+            "page_url": "^page_url$",
+            "page_path": "^page_path$",
+            "page_title": "^page_title$",
+            "device_type": "^device_type$",
+            "device_browser": "^device_browser$",
+            "device_os": "^device_os$",
+        },
+    },
     # Full daily-ETL extraction: 25 exact fields covering core + utm + page + device + geo
     {
         "function": "json_extract_columns",
         "scenario": "etl_full",
         "patterns": {**_CORE_EXACT, **_UTM_EXACT, **_PAGE_EXACT, **_DEVICE_EXACT, **_GEO_EXACT},
+    },
+    # Production-mirror: matches the rick/data `event_attribute_rules` shape
+    # of "few exact + one regex". Lets us measure the realistic mixed case
+    # without the spec's regex disqualifying trivial-mode being the headline.
+    {
+        "function": "json_extract_columns",
+        "scenario": "prod_mirror",
+        "patterns": {
+            "user_id": "^user_id$",
+            "event_name": "^event_name$",
+            "page_url": "^page_url$",
+            "ec_item_ids": r"^ec_items\[\d+\]\.item_id$",
+        },
     },
     # Prefix bucketing: collapse each field group into a single newline-joined string
     {
