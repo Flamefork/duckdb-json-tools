@@ -1262,11 +1262,40 @@ static inline idx_t CountTrailingZeros(uint64_t x) {
 #endif
 }
 
+// If `pattern` is of the form `^<simple-identifier>$`, return the identifier;
+// otherwise return empty string. Used to detect the "trivial" extraction mode
+// where every output column maps 1:1 to a fixed top-level key name and we can
+// skip the per-row iter+regex+cache machinery in favour of N direct
+// yyjson_obj_getn lookups.
+static std::string ExtractTrivialKey(const std::string &pattern) {
+	if (pattern.size() < 3 || pattern.front() != '^' || pattern.back() != '$') {
+		return "";
+	}
+	const auto name_begin = pattern.data() + 1;
+	const auto name_len = pattern.size() - 2;
+	auto is_ident_start = [](char c) {
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+	};
+	auto is_ident_cont = [](char c) {
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+	};
+	if (!is_ident_start(name_begin[0])) {
+		return "";
+	}
+	for (size_t i = 1; i < name_len; i++) {
+		if (!is_ident_cont(name_begin[i])) {
+			return "";
+		}
+	}
+	return std::string(name_begin, name_len);
+}
+
 struct JsonExtractColumnsBindData : public FunctionData {
 	JsonExtractColumnsBindData(vector<string> column_names_p, vector<string> patterns_p,
 	                           child_list_t<LogicalType> children_p, duckdb_re2::RE2::Options options_p)
 	    : column_names(std::move(column_names_p)), patterns(std::move(patterns_p)), children(std::move(children_p)),
 	      options(std::move(options_p)), column_count(this->patterns.size()) {
+		DetectTrivialMode();
 		BuildPatternSet();
 	}
 
@@ -1276,6 +1305,11 @@ struct JsonExtractColumnsBindData : public FunctionData {
 	duckdb_re2::RE2::Options options;
 	unique_ptr<duckdb_re2::RE2::Set> pattern_set;
 	idx_t column_count;
+	// When trivial_mode is true, trivial_keys[i] is the literal JSON key for
+	// column i (unanchored, simple identifier). Runtime skips RE2 + bitset cache
+	// entirely and does column_count × yyjson_obj_getn per row.
+	bool trivial_mode = false;
+	vector<string> trivial_keys;
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<JsonExtractColumnsBindData>(column_names, patterns, children, options);
@@ -1288,6 +1322,30 @@ struct JsonExtractColumnsBindData : public FunctionData {
 	}
 
 private:
+	// When trivial mode applies, runtime cost is column_count × O(N/2) yyjson_obj_getn
+	// walks per row vs O(N) iter+cache for the general path (where N is row's top-level
+	// key count). The trivial path wins for small column_count but loses as it scales
+	// linearly with patterns; empirically the crossover is around 10-15 columns on a
+	// 30-50 key row. Gate conservatively.
+	static constexpr idx_t TRIVIAL_MAX_COLUMNS = 12;
+
+	void DetectTrivialMode() {
+		if (patterns.size() > TRIVIAL_MAX_COLUMNS) {
+			return;
+		}
+		trivial_keys.reserve(patterns.size());
+		for (const auto &p : patterns) {
+			auto key = ExtractTrivialKey(p);
+			if (key.empty()) {
+				trivial_keys.clear();
+				trivial_mode = false;
+				return;
+			}
+			trivial_keys.push_back(std::move(key));
+		}
+		trivial_mode = !trivial_keys.empty();
+	}
+
 	void BuildPatternSet() {
 		pattern_set = make_uniq<duckdb_re2::RE2::Set>(options, duckdb_re2::RE2::UNANCHORED);
 		for (idx_t i = 0; i < patterns.size(); i++) {
@@ -1653,6 +1711,57 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 	UnifiedVectorFormat json_data;
 	args.data[0].ToUnifiedFormat(args.size(), json_data);
 	auto json_inputs = UnifiedVectorFormat::GetData<string_t>(json_data);
+
+	// Trivial-mode fast path: when every column is a fixed top-level key name
+	// (no regex, no prefix, no multi-match possible), skip the iter+cache+
+	// fragments machinery and do column_count × yyjson_obj_getn per row. Wins
+	// for small column_count vs full key iteration; gated by bind-time check
+	// (see DetectTrivialMode) so the general path below stays untouched and
+	// non-trivial workloads see no regression from this branch.
+	if (bind_data.trivial_mode) {
+		for (idx_t row = 0; row < args.size(); row++) {
+			auto json_idx = json_data.sel->get_index(row);
+			if (!json_data.validity.RowIsValid(json_idx)) {
+				result_validity.SetInvalid(row);
+				for (auto &validity : child_validities) {
+					validity->SetInvalid(row);
+				}
+				continue;
+			}
+			result_validity.SetValid(row);
+
+			auto &allocator = *local_state.json_allocator;
+			allocator.Reset();
+			auto alc = allocator.GetYYAlc();
+
+			auto input = json_inputs[json_idx];
+			auto input_data = input.GetDataUnsafe();
+			auto input_length = input.GetSize();
+			duckdb_yyjson::yyjson_read_err err;
+			auto doc = yyjson_doc_ptr(
+			    yyjson_read_opts(const_cast<char *>(input_data), input_length, JSONCommon::READ_FLAG, alc, &err));
+			if (!doc) {
+				throw InvalidInputException("json_extract_columns: %s",
+				                            JSONCommon::FormatParseError(input_data, input_length, err));
+			}
+			auto root = yyjson_doc_get_root(doc.get());
+			if (!root || !yyjson_is_obj(root)) {
+				throw InvalidInputException("json_extract_columns: expected JSON object input");
+			}
+
+			for (idx_t col_idx = 0; col_idx < column_count; col_idx++) {
+				const auto &key_name = bind_data.trivial_keys[col_idx];
+				auto val = duckdb_yyjson::yyjson_obj_getn(root, key_name.data(), key_name.size());
+				if (!val) {
+					child_validities[col_idx]->SetInvalid(row);
+					continue;
+				}
+				child_validities[col_idx]->SetValid(row);
+				child_data[col_idx][row] = AddYyjsonValueToVector(*children[col_idx], val, alc);
+			}
+		}
+		return;
+	}
 
 	auto has_separator_argument = args.ColumnCount() == 3;
 	idx_t separator_column_index = has_separator_argument ? args.ColumnCount() - 1 : 0;
