@@ -1325,9 +1325,11 @@ private:
 	// When trivial mode applies, runtime cost is column_count × O(N/2) yyjson_obj_getn
 	// walks per row vs O(N) iter+cache for the general path (where N is row's top-level
 	// key count). The trivial path wins for small column_count but loses as it scales
-	// linearly with patterns; empirically the crossover is around 10-15 columns on a
-	// 30-50 key row. Gate conservatively.
-	static constexpr idx_t TRIVIAL_MAX_COLUMNS = 12;
+	// linearly with patterns. Sweep on the realistic bench (avg 30 flat keys/row):
+	//   K=16 trivial vs general: -7% (251 vs 271 ms)
+	//   K=25 trivial vs general: +5% regression (328 vs 313 ms)
+	// Crossover sits between K=20 and K=25 for ~30-key rows; cap conservatively at 20.
+	static constexpr idx_t TRIVIAL_MAX_COLUMNS = 20;
 
 	void DetectTrivialMode() {
 		if (patterns.size() > TRIVIAL_MAX_COLUMNS) {
