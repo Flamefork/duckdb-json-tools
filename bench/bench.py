@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config import DATA_DIR, SIZES
+from config import DATA_DIR, SIZES, URL_DEFAULT_SIZES
 
 
 def ensure_data_exists() -> bool:
@@ -21,7 +21,12 @@ def ensure_data_exists() -> bool:
     for size_name in SIZES:
         path = DATA_DIR / f"events_{size_name}.parquet"
         if not path.exists():
-            missing.append(size_name)
+            missing.append(f"events_{size_name}")
+
+    for size_name in URL_DEFAULT_SIZES:
+        path = DATA_DIR / f"urls_{size_name}.parquet"
+        if not path.exists():
+            missing.append(f"urls_{size_name}")
 
     if missing:
         print(f"Data files missing: {', '.join(missing)}")

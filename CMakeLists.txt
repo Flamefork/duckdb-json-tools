@@ -7,6 +7,7 @@ set(TARGET_NAME json_tools)
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
 # Note that it should also be removed from vcpkg.json to prevent needlessly installing it..
 find_package(OpenSSL REQUIRED)
+find_package(ada REQUIRED)
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
@@ -19,13 +20,13 @@ set(EXTENSION_SOURCES src/json_tools_extension.cpp)
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# Link OpenSSL in both the static library as the loadable extension
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+# Link dependencies in both the static library as the loadable extension
+target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto ada::ada)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto ada::ada)
 
-# ankerl::unordered_dense (vendored in src/include/ankerl) requires C++17.
-target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
-target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
+# ada-url requires C++20.
+target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_20)
+target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_20)
 
 install(
   TARGETS ${EXTENSION_NAME}

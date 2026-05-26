@@ -15,6 +15,7 @@ This extension provides a set of utility functions to work with JSON data, focus
 - **`json_add_prefix(json, text)`**: Adds a string prefix to every top-level key in a JSON object.
 - **`json_extract_columns(json, columns[, separator])`**: Pulls selected root keys into a struct of `VARCHAR` fields using regex patterns.
 - **`json_group_merge(json [ORDER BY ...])`**: Streams JSON patches with RFC 7396 merge semantics without materializing intermediate lists.
+- **`json_parse_url(text)`**: Parses a URL into JSON fields and materializes query parameters as an object.
 
 ## Quick Start
 
@@ -29,6 +30,10 @@ SELECT json_flatten('{"user": {"name": "Alice", "age": 30}}');
 -- Add prefix to keys
 SELECT json_add_prefix('{"a": 1, "b": 2}', 'prefix.');
 -- Result: {"prefix.a":1,"prefix.b":2}
+
+-- Parse URL components
+SELECT json_parse_url('https://example.com/path?utm_source=duckdb');
+-- Result: {"scheme":"https","host":"example.com","hostname":"example.com","port":"","path":"/path","query":"utm_source=duckdb","query_params":{"utm_source":"duckdb"},"fragment":""}
 ```
 
 ## Installation
@@ -99,6 +104,49 @@ SELECT json_flatten('{"data": [], "meta": {}, "count": 5}');
 *Result:*
 ```json
 {"count":5}
+```
+
+### `json_parse_url(url) -> json`
+
+Parses an absolute URL string into a JSON object with URL components and decoded query parameters.
+
+The returned object contains:
+- `scheme`
+- `host`
+- `hostname`
+- `port`
+- `path`
+- `query`
+- `query_params`
+- `fragment`
+
+**Example:**
+```sql
+SELECT json_parse_url('https://example.com:8443/path/to?q=1&q=2&flag=&encoded=a%20b#frag');
+```
+*Result:*
+```json
+{"scheme":"https","host":"example.com:8443","hostname":"example.com","port":"8443","path":"/path/to","query":"q=1&q=2&flag=&encoded=a%20b","query_params":{"q":"2","flag":"","encoded":"a b"},"fragment":"frag"}
+```
+
+`query_params` is an object of strings for convenient JSON extraction. Query keys and values are percent-decoded, and `+` is decoded as a space. If a query key appears multiple times, the last value wins:
+
+```sql
+SELECT json_extract_string(json_parse_url('https://example.com/?q=1&q=2'), '$.query_params.q');
+```
+*Result:*
+```text
+2
+```
+
+Parameters without `=` are represented as empty strings:
+
+```sql
+SELECT json_extract_string(json_parse_url('https://example.com/?flag'), '$.query_params.flag') = '';
+```
+*Result:*
+```text
+true
 ```
 
 ### `json_add_prefix(json, prefix) -> json`
@@ -207,6 +255,7 @@ FROM (VALUES ('{"keep":1}'::json, 1), ('{"keep":null}'::json, 2)) AS t(patch, ts
 - `json_group_merge()` surfaces DuckDB JSON parse errors for invalid text and raises on merge buffers that exceed DuckDB limits
 - Maximum nesting depth: 1000 levels
 - Empty objects (`{}`) and arrays (`[]`) are omitted from flattened output
+- `json_parse_url()` returns an error for invalid URLs
 
 ## Development
 

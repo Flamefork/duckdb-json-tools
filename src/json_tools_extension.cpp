@@ -14,6 +14,7 @@
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/scalar/regexp.hpp"
+#include "ada.h"
 #include "re2/set.h"
 #include "../duckdb/extension/json/include/json_common.hpp"
 #include "ankerl/unordered_dense.h"
@@ -33,7 +34,6 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 
 namespace duckdb {
@@ -147,6 +147,26 @@ static unique_ptr<FunctionLocalState> JsonAddPrefixInitLocalState(ExpressionStat
                                                                   const BoundFunctionExpression &, FunctionData *) {
 	auto &context = state.GetContext();
 	return make_uniq<JsonAddPrefixLocalState>(BufferAllocator::Get(context));
+}
+
+struct JsonParseUrlQueryParam {
+	std::string_view key;
+	std::string_view value;
+	uint64_t key_hash;
+};
+
+struct JsonParseUrlLocalState : public FunctionLocalState {
+	explicit JsonParseUrlLocalState(Allocator &allocator) : json_allocator(std::make_shared<JSONAllocator>(allocator)) {
+	}
+
+	shared_ptr<JSONAllocator> json_allocator;
+	vector<JsonParseUrlQueryParam> query_params;
+};
+
+static unique_ptr<FunctionLocalState> JsonParseUrlInitLocalState(ExpressionState &state,
+                                                                 const BoundFunctionExpression &, FunctionData *) {
+	auto &context = state.GetContext();
+	return make_uniq<JsonParseUrlLocalState>(BufferAllocator::Get(context));
 }
 
 // Hash map based JSON value representation for O(1) key operations
@@ -2251,7 +2271,142 @@ inline string_t JsonAddPrefixSingle(Vector &result, const string_t &input, const
 	return StringVector::AddString(result, output_cstr, output_length);
 }
 
+static std::string_view StripLeadingChar(std::string_view input, char prefix) {
+	if (!input.empty() && input.front() == prefix) {
+		return input.substr(1);
+	}
+	return input;
+}
+
+static std::string_view StripTrailingChar(std::string_view input, char suffix) {
+	if (!input.empty() && input.back() == suffix) {
+		return input.substr(0, input.size() - 1);
+	}
+	return input;
+}
+
+static yyjson_mut_val *JsonParseUrlStringView(yyjson_mut_doc *doc, std::string_view value) {
+	auto data = value.empty() ? "" : value.data();
+	auto string_value = duckdb_yyjson::yyjson_mut_strn(doc, data, value.size());
+	if (!string_value) {
+		throw InternalException("json_parse_url: failed to allocate string value");
+	}
+	return string_value;
+}
+
+static yyjson_mut_val *JsonParseUrlCopiedString(yyjson_mut_doc *doc, std::string_view value) {
+	auto data = value.empty() ? "" : value.data();
+	auto string_value = yyjson_mut_strncpy(doc, data, value.size());
+	if (!string_value) {
+		throw InternalException("json_parse_url: failed to allocate string value");
+	}
+	return string_value;
+}
+
+static void JsonParseUrlAddMember(yyjson_mut_doc *doc, yyjson_mut_val *object, const char *key, yyjson_mut_val *value) {
+	auto key_value = duckdb_yyjson::yyjson_mut_str(doc, key);
+	if (!key_value || !yyjson_mut_obj_add(object, key_value, value)) {
+		throw InternalException("json_parse_url: failed to add object member");
+	}
+}
+
+static void JsonParseUrlAddStringViewMember(yyjson_mut_doc *doc, yyjson_mut_val *object, const char *key,
+                                            std::string_view value) {
+	JsonParseUrlAddMember(doc, object, key, JsonParseUrlStringView(doc, value));
+}
+
+static void JsonParseUrlAddQueryParam(yyjson_mut_doc *doc, yyjson_mut_val *object, std::string_view key,
+                                      std::string_view value) {
+	auto key_value = JsonParseUrlCopiedString(doc, key);
+	auto string_value = JsonParseUrlCopiedString(doc, value);
+	if (!yyjson_mut_obj_add(object, key_value, string_value)) {
+		throw InternalException("json_parse_url: failed to add query parameter");
+	}
+}
+
+static void JsonParseUrlPutQueryParam(JsonParseUrlLocalState &local_state, std::string_view key,
+                                      std::string_view value) {
+	auto key_hash = ankerl::unordered_dense::hash<std::string_view> {}(key);
+	for (auto &query_param : local_state.query_params) {
+		if (query_param.key_hash == key_hash && query_param.key == key) {
+			query_param.value = value;
+			return;
+		}
+	}
+	local_state.query_params.push_back({key, value, key_hash});
+}
+
+inline string_t JsonParseUrlSingle(Vector &result, const string_t &input, JsonParseUrlLocalState &local_state) {
+	local_state.json_allocator->Reset();
+	auto alc = local_state.json_allocator->GetYYAlc();
+	auto input_data = input.GetDataUnsafe();
+	auto input_length = input.GetSize();
+	auto url = ada::parse<ada::url_aggregator>(std::string_view(input_data, input_length));
+	if (!url) {
+		throw InvalidInputException("json_parse_url: invalid URL");
+	}
+
+	auto out_doc = yyjson_mut_doc_ptr(yyjson_mut_doc_new(alc));
+	if (!out_doc) {
+		throw InternalException("json_parse_url: failed to allocate output document");
+	}
+	auto out_root = yyjson_mut_obj(out_doc.get());
+	if (!out_root) {
+		throw InternalException("json_parse_url: failed to allocate output object");
+	}
+	yyjson_mut_doc_set_root(out_doc.get(), out_root);
+
+	JsonParseUrlAddStringViewMember(out_doc.get(), out_root, "scheme",
+	                                StripTrailingChar(std::string_view(url->get_protocol()), ':'));
+	JsonParseUrlAddStringViewMember(out_doc.get(), out_root, "host", std::string_view(url->get_host()));
+	JsonParseUrlAddStringViewMember(out_doc.get(), out_root, "hostname", std::string_view(url->get_hostname()));
+	JsonParseUrlAddStringViewMember(out_doc.get(), out_root, "port", std::string_view(url->get_port()));
+	JsonParseUrlAddStringViewMember(out_doc.get(), out_root, "path", std::string_view(url->get_pathname()));
+
+	auto query = StripLeadingChar(std::string_view(url->get_search()), '?');
+	JsonParseUrlAddStringViewMember(out_doc.get(), out_root, "query", query);
+
+	auto query_params = yyjson_mut_obj(out_doc.get());
+	if (!query_params) {
+		throw InternalException("json_parse_url: failed to allocate query_params object");
+	}
+	if (!query.empty()) {
+		ada::url_search_params params {query};
+		local_state.query_params.reserve(params.size());
+		for (const auto &entry : params) {
+			JsonParseUrlPutQueryParam(local_state, entry.first, entry.second);
+		}
+		for (const auto &entry : local_state.query_params) {
+			JsonParseUrlAddQueryParam(out_doc.get(), query_params, entry.key, entry.value);
+		}
+		// The views above point into params, so local state must not retain them across rows.
+		local_state.query_params.clear();
+	}
+	JsonParseUrlAddMember(out_doc.get(), out_root, "query_params", query_params);
+
+	JsonParseUrlAddStringViewMember(out_doc.get(), out_root, "fragment",
+	                                StripLeadingChar(std::string_view(url->get_hash()), '#'));
+
+	size_t output_length = 0;
+	auto output_cstr = yyjson_mut_write_opts(out_doc.get(), JSONCommon::WRITE_FLAG, nullptr, &output_length, nullptr);
+	if (!output_cstr) {
+		throw InternalException("json_parse_url: failed to serialize output JSON");
+	}
+	std::unique_ptr<char, decltype(&free)> output_handle(output_cstr, free);
+	return StringVector::AddString(result, output_cstr, output_length);
+}
+
 } // namespace
+
+inline void JsonParseUrlScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto state_ptr = ExecuteFunctionState::GetFunctionState(state);
+	D_ASSERT(state_ptr);
+	auto &local_state = state_ptr->Cast<JsonParseUrlLocalState>();
+	auto &input = args.data[0];
+	UnaryExecutor::Execute<string_t, string_t>(input, result, args.size(), [&](const string_t &url_input) {
+		return JsonParseUrlSingle(result, url_input, local_state);
+	});
+}
 
 inline void JsonFlattenScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	// Thread-safety: per-invocation state lives in JsonFlattenLocalState, so vectors can execute in parallel.
@@ -2281,6 +2436,11 @@ inline void JsonAddPrefixScalarFun(DataChunk &args, ExpressionState &state, Vect
 
 static void LoadInternal(JsonToolsLoadContext &ctx) {
 	child_list_t<LogicalType> empty_children;
+	auto json_parse_url_scalar_function =
+	    ScalarFunction("json_parse_url", {LogicalType::VARCHAR}, LogicalType::JSON(), JsonParseUrlScalarFun, nullptr,
+	                   nullptr, nullptr, JsonParseUrlInitLocalState);
+	RegisterScalarFunction(ctx, json_parse_url_scalar_function);
+
 	auto json_extract_columns_function =
 	    ScalarFunction("json_extract_columns", {LogicalType::JSON(), LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                   LogicalType::STRUCT(empty_children), JsonExtractColumnsFunction, JsonExtractColumnsBind, nullptr,

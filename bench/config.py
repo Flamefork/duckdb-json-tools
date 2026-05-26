@@ -14,10 +14,18 @@ SIZES = {
     "100k": 100_000,
 }
 
+URL_SIZES = {
+    "10k": 10_000,
+    "100k": 100_000,
+    "1M": 1_000_000,
+}
+
+URL_DEFAULT_SIZES = ["10k", "100k", "1M"]
+
 DEFAULT_RUNS = 10
 DEFAULT_PROFILE_RUNS = 1
 DEFAULT_TOLERANCE_PCT = 5
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_MIN_EFFECT_MS = 5.0
 
 
@@ -80,6 +88,42 @@ SCENARIOS = [
     # ─── json_add_prefix ───
     {"function": "json_add_prefix", "scenario": "basic"},
 
+    # ─── json_parse_url ───
+    {
+        "function": "noop_url",
+        "scenario": "marketing",
+        "data_kind": "urls",
+        "sizes": URL_DEFAULT_SIZES,
+        "url_column": "url_marketing",
+    },
+    {
+        "function": "json_parse_url",
+        "scenario": "short",
+        "data_kind": "urls",
+        "sizes": URL_DEFAULT_SIZES,
+        "url_column": "url_short",
+    },
+    {
+        "function": "json_parse_url",
+        "scenario": "marketing",
+        "data_kind": "urls",
+        "sizes": URL_DEFAULT_SIZES,
+        "url_column": "url_marketing",
+    },
+    {
+        "function": "json_parse_url",
+        "scenario": "wide_query",
+        "data_kind": "urls",
+        "sizes": URL_DEFAULT_SIZES,
+        "url_column": "url_wide_query",
+    },
+    {
+        "function": "json_parse_url",
+        "scenario": "mixed",
+        "data_kind": "urls",
+        "sizes": URL_DEFAULT_SIZES,
+        "url_column": "url_mixed",
+    },
     # ─── json_extract_columns ───
     # Smallest realistic ETL: pick 5 core columns
     {

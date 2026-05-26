@@ -1,0 +1,49 @@
+# name: test/sql/json_parse_url.test
+# description: json_parse_url parses URL components and materializes query parameters as a JSON object
+# group: [sql]
+
+require json_tools
+
+require json
+
+query I
+SELECT json_parse_url('https://example.com:8443/path/to?q=1&q=2&flag=&encoded=a%20b#frag');
+----
+{"scheme":"https","host":"example.com:8443","hostname":"example.com","port":"8443","path":"/path/to","query":"q=1&q=2&flag=&encoded=a%20b","query_params":{"q":"2","flag":"","encoded":"a b"},"fragment":"frag"}
+
+query I
+SELECT json_parse_url('https://example.com/');
+----
+{"scheme":"https","host":"example.com","hostname":"example.com","port":"","path":"/","query":"","query_params":{},"fragment":""}
+
+query I
+SELECT json_extract_string(json_parse_url('https://example.com/?plus=a+b&flag'), '$.query_params.plus');
+----
+a b
+
+query I
+SELECT json_extract_string(json_parse_url('https://example.com/?plus=a+b&flag'), '$.query_params.flag') = '';
+----
+true
+
+query I
+SELECT json_extract_string(json_parse_url('https://example.com/?quoted=%22x%5C%0B'), '$.query_params.quoted') = chr(34) || 'x' || chr(92) || chr(11);
+----
+true
+
+query I
+SELECT json_extract_string(json_parse_url('https://example.com/?bad=%ZZ&short=%2&ok=%22'), '$.query_params.bad') = '%ZZ'
+   AND json_extract_string(json_parse_url('https://example.com/?bad=%ZZ&short=%2&ok=%22'), '$.query_params.short') = '%2'
+   AND json_extract_string(json_parse_url('https://example.com/?bad=%ZZ&short=%2&ok=%22'), '$.query_params.ok') = chr(34);
+----
+true
+
+query I
+SELECT json_parse_url(NULL);
+----
+NULL
+
+statement error
+SELECT json_parse_url('http://[invalid');
+----
+Invalid Input Error: json_parse_url: invalid URL

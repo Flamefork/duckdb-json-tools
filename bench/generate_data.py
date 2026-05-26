@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 import duckdb
 
-from config import DATA_DIR, SIZES
+from config import DATA_DIR, SIZES, URL_DEFAULT_SIZES, URL_SIZES
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -453,19 +453,149 @@ def generate_data(size_name: str, num_rows: int, seed: int) -> None:
     print(f"  Saved to {output_path}")
 
 
+def clean_path(path: str) -> str:
+    return path.split("?", 1)[0]
+
+
+def make_short_url(rng: random.Random) -> str:
+    return f"https://{rng.choice(DOMAINS)}{clean_path(rng.choice(PAGE_PATHS))}"
+
+
+def make_marketing_url(rng: random.Random, row_idx: int) -> str:
+    params = [
+        ("utm_source", rng.choice(UTM_SOURCES)),
+        ("utm_medium", rng.choice(UTM_MEDIUMS)),
+        ("utm_campaign", rng.choice(UTM_CAMPAIGNS)),
+        ("utm_content", rng.choice(UTM_CONTENTS)),
+        ("gclid", f"g_{row_idx}_{rng.randint(100000, 999999)}"),
+        ("fbclid", f"fb_{rng.randint(100000000, 999999999)}"),
+        ("term", rng.choice(["running+shoes", "summer%20dress", "coffee%20mug", "wireless+headphones"])),
+        ("flag", ""),
+    ]
+    query = "&".join(key if key == "flag" else f"{key}={value}" for key, value in params)
+    return f"https://{rng.choice(DOMAINS)}{clean_path(rng.choice(PAGE_PATHS))}?{query}"
+
+
+def make_wide_query_url(rng: random.Random, row_idx: int) -> str:
+    params = [("session_id", f"s_{row_idx}"), ("dup", "first")]
+    for i in range(40):
+        key = f"p{i:02d}"
+        value = rng.choice([
+            f"v{rng.randint(1000, 9999)}",
+            f"item%20{rng.randint(100, 999)}",
+            f"q+{rng.randint(10, 99)}",
+        ])
+        params.append((key, value))
+    params.extend([
+        ("utm_source", "first"),
+        ("utm_source", rng.choice(UTM_SOURCES)),
+        ("dup", "last"),
+        ("empty", ""),
+    ])
+    query = "&".join(f"{key}={value}" for key, value in params)
+    return f"https://{rng.choice(DOMAINS)}{clean_path(rng.choice(PAGE_PATHS))}?{query}#section-{row_idx % 10}"
+
+
+def generate_url_row(row_idx: int, seed: int) -> dict:
+    rng = make_rng(seed, row_idx)
+    url_short = make_short_url(rng)
+    url_marketing = make_marketing_url(rng, row_idx)
+    url_wide_query = make_wide_query_url(rng, row_idx)
+    url_mixed = rng.choices(
+        [url_marketing, url_short, url_wide_query],
+        weights=[50, 35, 15],
+        k=1,
+    )[0]
+    return {
+        "url_short": url_short,
+        "url_marketing": url_marketing,
+        "url_wide_query": url_wide_query,
+        "url_mixed": url_mixed,
+    }
+
+
+def generate_url_data(size_name: str, num_rows: int, seed: int) -> None:
+    print(f"Generating URL {size_name} ({num_rows:,} rows) with seed={seed}...")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = DATA_DIR / f"urls_{size_name}.parquet"
+
+    conn = duckdb.connect()
+
+    batch_size = 50_000
+    rows_generated = 0
+    temp_table_created = False
+
+    while rows_generated < num_rows:
+        batch_rows = min(batch_size, num_rows - rows_generated)
+        batch = [generate_url_row(rows_generated + i, seed) for i in range(batch_rows)]
+
+        conn.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE batch (
+                url_short VARCHAR,
+                url_marketing VARCHAR,
+                url_wide_query VARCHAR,
+                url_mixed VARCHAR
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO batch VALUES (?, ?, ?, ?)",
+            [(r["url_short"], r["url_marketing"], r["url_wide_query"], r["url_mixed"]) for r in batch],
+        )
+
+        if not temp_table_created:
+            conn.execute("CREATE OR REPLACE TABLE data AS SELECT * FROM batch")
+            temp_table_created = True
+        else:
+            conn.execute("INSERT INTO data SELECT * FROM batch")
+
+        rows_generated += batch_rows
+        print(f"  {rows_generated:,} / {num_rows:,}")
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        f"""
+        COPY data TO '{output_path}' (
+            FORMAT PARQUET,
+            KV_METADATA {{
+                seed: '{seed}',
+                size: '{size_name}',
+                rows: '{num_rows}',
+                generated_at: '{generated_at}',
+                schema_version: 'url_bench_v1'
+            }}
+        )
+        """
+    )
+    conn.close()
+
+    print(f"  Saved to {output_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate marketing-telemetry benchmark data (v2)")
-    parser.add_argument("--size", choices=list(SIZES.keys()),
+    parser.add_argument("--size", choices=sorted(set(SIZES) | set(URL_SIZES)),
                         help="Generate only this size (default: all)")
+    parser.add_argument("--kind", choices=["all", "events", "urls"], default="all",
+                        help="Dataset kind to generate (default: all)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
     args = parser.parse_args()
 
     if args.size:
-        generate_data(args.size, SIZES[args.size], args.seed)
+        if args.kind in ("all", "events") and args.size in SIZES:
+            generate_data(args.size, SIZES[args.size], args.seed)
+        if args.kind in ("all", "urls") and args.size in URL_SIZES:
+            generate_url_data(args.size, URL_SIZES[args.size], args.seed)
     else:
-        for size_name, num_rows in SIZES.items():
-            generate_data(size_name, num_rows, args.seed)
+        if args.kind in ("all", "events"):
+            for size_name, num_rows in SIZES.items():
+                generate_data(size_name, num_rows, args.seed)
+        if args.kind in ("all", "urls"):
+            for size_name in URL_DEFAULT_SIZES:
+                generate_url_data(size_name, URL_SIZES[size_name], args.seed)
 
 
 if __name__ == "__main__":

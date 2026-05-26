@@ -18,10 +18,39 @@ from config import (
     SCENARIOS,
     SCHEMA_VERSION,
     SIZES,
+    URL_SIZES,
 )
 from environment import collect_environment
 
 DEFAULT_SEED = 42
+
+
+def get_data_path(size: str, scenario_config: dict) -> Path:
+    if "data_file" in scenario_config:
+        return scenario_config["data_file"]
+    if scenario_config.get("data_kind") == "urls":
+        return DATA_DIR / f"urls_{size}.parquet"
+    return DATA_DIR / f"events_{size}.parquet"
+
+
+def get_scenario_sizes(scenario_config: dict) -> list[str]:
+    if "size" in scenario_config:
+        return [scenario_config["size"]]
+    if "sizes" in scenario_config:
+        return scenario_config["sizes"]
+    return list(SIZES.keys())
+
+
+def get_row_count(size: str) -> int | None:
+    if size in SIZES:
+        return SIZES[size]
+    if size in URL_SIZES:
+        return URL_SIZES[size]
+    if size.endswith("k") and size[:-1].isdigit():
+        return int(size[:-1]) * 1_000
+    if size.endswith("M") and size[:-1].isdigit():
+        return int(size[:-1]) * 1_000_000
+    return None
 
 
 def create_connection() -> duckdb.DuckDBPyConnection:
@@ -43,6 +72,20 @@ def build_query(scenario_config: dict, data_path: Path) -> str:
     table = f"read_parquet('{data_path}')"
 
     match scenario_config["function"]:
+        case "noop_url":
+            url_column = scenario_config["url_column"]
+            return f"""
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT {url_column} AS r FROM {table}
+            """
+
+        case "json_parse_url":
+            url_column = scenario_config["url_column"]
+            return f"""
+                CREATE OR REPLACE TEMP TABLE _bench_out AS
+                SELECT json_parse_url({url_column}) AS r FROM {table}
+            """
+
         case "json_flatten":
             return f"""
                 CREATE OR REPLACE TEMP TABLE _bench_out AS
@@ -117,12 +160,12 @@ def run_benchmarks(
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     for size, scenario_config in cases_to_run:
-        data_path = (
-            scenario_config["data_file"] if "data_file" in scenario_config else DATA_DIR / f"events_{size}.parquet"
-        )
+        data_path = get_data_path(size, scenario_config)
         if not data_path.exists():
-            if "data_file" in scenario_config:
+            if "data_file" in scenario_config or scenario_config.get("data_kind") == "urls":
                 print(f"FAILED: benchmark data file not found: {data_path}")
+                if scenario_config.get("data_kind") == "urls":
+                    print(f"Generate it with: uv run python bench/generate_data.py --kind urls --size {size}")
                 raise SystemExit(2)
             print(f"Skipping {size}: data file not found")
             continue
@@ -144,7 +187,12 @@ def run_benchmarks(
 
         try:
             timing = run_single_benchmark(conn, query, runs)
-            print(f"{timing['median_ms']:.1f}ms")
+            row_count = get_row_count(size)
+            rows_per_second = None
+            if row_count is not None and timing["min_ms"] > 0:
+                rows_per_second = round(row_count / (timing["min_ms"] / 1000))
+            throughput_text = f", {rows_per_second:,} rows/s" if rows_per_second is not None else ""
+            print(f"{timing['median_ms']:.1f}ms{throughput_text}")
 
             results.append({
                 "function": function,
@@ -155,6 +203,7 @@ def run_benchmarks(
                 "max_ms": timing["max_ms"],
                 "runs": runs,
                 "timestamp": timestamp,
+                "rows_per_second": rows_per_second,
             })
         except Exception as e:
             print(f"FAILED: {e}")
@@ -190,6 +239,7 @@ def save_results_json(
                 "median_ms": r["median_ms"],
                 "max_ms": r["max_ms"],
                 "runs": r["runs"],
+                "rows_per_second": r["rows_per_second"],
             }
             for r in results
         ],
@@ -204,14 +254,17 @@ def show_results(results_path: Path) -> None:
     with open(results_path) as f:
         data = json.load(f)
     conn.sql("CREATE TABLE results AS SELECT * FROM (VALUES " +
-             ", ".join(f"('{r['function']}', '{r['scenario']}', '{r['size']}', {r['min_ms']}, {r['median_ms']}, {r['max_ms']})"
-                      for r in data["results"]) +
-             ") AS t(function, scenario, size, min_ms, median_ms, max_ms)")
+             ", ".join(
+                 f"('{r['function']}', '{r['scenario']}', '{r['size']}', {r['min_ms']}, {r['median_ms']}, {r['max_ms']}, {r.get('rows_per_second') or 'NULL'})"
+                 for r in data["results"]
+             ) +
+             ") AS t(function, scenario, size, min_ms, median_ms, max_ms, rows_per_second)")
     conn.sql("""
         SELECT function, scenario, size,
                round(min_ms, 1) as min_ms,
                round(median_ms, 1) as median_ms,
-               round(max_ms, 1) as max_ms
+               round(max_ms, 1) as max_ms,
+               rows_per_second
         FROM results
         ORDER BY function, scenario, size
     """).show()
@@ -237,7 +290,7 @@ def main() -> None:
     # Build list of (size, scenario) pairs, filtering by prefix if specified
     cases_to_run: list[tuple[str, dict]] = []
     for scenario_config in SCENARIOS:
-        sizes = [scenario_config["size"]] if "size" in scenario_config else SIZES.keys()
+        sizes = get_scenario_sizes(scenario_config)
         for size in sizes:
             case_id = get_case_id(scenario_config["function"], size, scenario_config["scenario"])
             if args.filter is None or args.filter in case_id:

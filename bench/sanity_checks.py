@@ -5,9 +5,10 @@ from pathlib import Path
 
 import duckdb
 
-from config import DATA_DIR, SIZES
+from config import DATA_DIR, SIZES, URL_SIZES
 
-REQUIRED_COLUMNS = ["json_nested", "json_flat", "g1e1", "g1e3", "g1e4"]
+REQUIRED_EVENT_COLUMNS = ["json_nested", "json_flat", "g1e1", "g1e3", "g1e4"]
+REQUIRED_URL_COLUMNS = ["url_short", "url_marketing", "url_wide_query", "url_mixed"]
 
 
 def check_row_count(conn: duckdb.DuckDBPyConnection, path: Path, expected: int) -> str | None:
@@ -19,11 +20,11 @@ def check_row_count(conn: duckdb.DuckDBPyConnection, path: Path, expected: int) 
     return None
 
 
-def check_schema(conn: duckdb.DuckDBPyConnection, path: Path) -> str | None:
+def check_schema(conn: duckdb.DuckDBPyConnection, path: Path, required_columns: list[str]) -> str | None:
     """Check required columns exist. Returns error message or None."""
     result = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{path}')").fetchall()
     columns = {row[0] for row in result}
-    missing = set(REQUIRED_COLUMNS) - columns
+    missing = set(required_columns) - columns
     if missing:
         return f"File `{path.name}` missing columns: {', '.join(sorted(missing))}"
     return None
@@ -45,7 +46,19 @@ def run_sanity_checks() -> int:
             errors.append(err)
 
         # Schema
-        if err := check_schema(conn, path):
+        if err := check_schema(conn, path, REQUIRED_EVENT_COLUMNS):
+            errors.append(err)
+
+    for size_name, expected_rows in URL_SIZES.items():
+        path = DATA_DIR / f"urls_{size_name}.parquet"
+
+        if not path.exists():
+            continue
+
+        if err := check_row_count(conn, path, expected_rows):
+            errors.append(err)
+
+        if err := check_schema(conn, path, REQUIRED_URL_COLUMNS):
             errors.append(err)
 
     conn.close()

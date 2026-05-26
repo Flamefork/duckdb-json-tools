@@ -98,6 +98,6 @@ def collect_environment(seed: int, sizes: list[str]) -> dict:
         "dataset": {
             "seed": seed,
             "sizes": sizes,
-            "schema": "marketing_telemetry_v1",
+            "schema": "marketing_telemetry_v2_url_bench_v1",
         },
     }

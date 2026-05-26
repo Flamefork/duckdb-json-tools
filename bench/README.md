@@ -48,6 +48,9 @@ Use `--filter` with substring matching to run specific benchmarks:
 # All benchmarks for a function
 uv run python bench/run_benchmarks.py --filter json_group_merge
 
+# URL parsing benchmarks only
+uv run python bench/run_benchmarks.py --filter json_parse_url
+
 # All benchmarks for a size
 uv run python bench/run_benchmarks.py --filter 10k
 
@@ -59,6 +62,39 @@ uv run python bench/run_benchmarks.py --filter json_group_merge/10k/few_groups
 ```
 
 Case ID format: `function/size/scenario` (e.g., `json_flatten/10k/basic`).
+
+## URL Benchmarks
+
+`json_parse_url` uses a separate deterministic URL dataset:
+
+| File | Default | Columns |
+|------|---------|---------|
+| `bench/data/urls_10k.parquet` | yes | `url_short`, `url_marketing`, `url_wide_query`, `url_mixed` |
+| `bench/data/urls_100k.parquet` | yes | `url_short`, `url_marketing`, `url_wide_query`, `url_mixed` |
+| `bench/data/urls_1M.parquet` | yes | `url_short`, `url_marketing`, `url_wide_query`, `url_mixed` |
+
+Scenarios:
+
+| Scenario | Purpose |
+|----------|---------|
+| `noop_url/marketing` | CTAS/read/write baseline without URL parsing |
+| `json_parse_url/short` | URL parse + JSON output without query parameters |
+| `json_parse_url/marketing` | Production-like URL with 5-8 query parameters |
+| `json_parse_url/wide_query` | 40+ query parameters with duplicates |
+| `json_parse_url/mixed` | Weighted mix: marketing, short, and wide-query URLs |
+
+Generate default URL data:
+
+```bash
+uv run python bench/generate_data.py --kind urls
+```
+
+Run URL benchmarks:
+
+```bash
+uv run python bench/run_benchmarks.py --filter json_parse_url/100k
+uv run python bench/run_benchmarks.py --filter json_parse_url/1M --runs 3
+```
 
 ## Artifacts
 
@@ -157,7 +193,7 @@ uv run python bench/generate_data.py
 
 ### Dataset Structure
 
-Each parquet file contains:
+Each `events_*.parquet` file contains:
 
 | Column | Description |
 |--------|-------------|
@@ -174,6 +210,11 @@ Dataset sizes are defined in `bench/config.py`:
 - `10k`: 10,000 rows
 - `100k`: 100,000 rows
 
+URL benchmark sizes are defined separately:
+- `10k`: 10,000 rows
+- `100k`: 100,000 rows
+- `1M`: 1,000,000 rows
+
 ## Adding New Benchmarks
 
 1. **Define scenario in `config.py`:**
@@ -187,7 +228,10 @@ Dataset sizes are defined in `bench/config.py`:
 2. **Add query builder in `run_benchmarks.py`:**
    ```python
    case "json_new_fn":
-       return f"SELECT sum(length(CAST(json_new_fn(json_nested) AS VARCHAR))) FROM {table}"
+       return f"""
+           CREATE OR REPLACE TEMP TABLE _bench_out AS
+           SELECT json_new_fn(json_nested) AS r FROM {table}
+       """
    ```
 
 3. **Run and save baseline:**
@@ -196,4 +240,4 @@ Dataset sizes are defined in `bench/config.py`:
    uv run python bench/compare_results.py --save-baseline
    ```
 
-Cases are auto-discovered from `SIZES × SCENARIOS` (currently 27 cases).
+Cases are auto-discovered from scenario-specific sizes in `bench/config.py`.

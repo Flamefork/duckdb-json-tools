@@ -66,7 +66,7 @@ def diff_environment(baseline_env: dict | None, latest_env: dict | None) -> dict
     # Dataset nested comparison
     baseline_ds = baseline_env.get("dataset", {})
     latest_ds = latest_env.get("dataset", {})
-    for key in ["seed", "sizes", "complexity_weights"]:
+    for key in ["seed", "sizes", "schema", "complexity_weights"]:
         baseline_val = baseline_ds.get(key)
         latest_val = latest_ds.get(key)
         if baseline_val != latest_val:
