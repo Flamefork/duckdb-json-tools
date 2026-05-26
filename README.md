@@ -311,5 +311,8 @@ See [GitHub Issues](https://github.com/Flamefork/duckdb-json-tools/issues) for c
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+The source tree and release binaries also include third-party code. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for license notices.
+
 ---
 *This extension was originally based on the [DuckDB Extension Template](https://github.com/duckdb/extension-template).*
