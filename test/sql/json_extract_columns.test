@@ -39,6 +39,50 @@ SELECT (json_extract_columns('{"abc":1,"xabcx":2}', '{"v":"abc"}', ',')).v;
 ----
 1,2
 
+# Mixed exact + regex extraction
+query I
+WITH res AS (
+    SELECT json_extract_columns(
+        '{"url":"https://example.test","event_name":"purchase","products.0.category":"books"}',
+        '{"url":"^url$","event_name":"^event_name$","product_category":"^products.\\d+.category$"}',
+        chr(10)
+    ) AS r)
+SELECT r.url = 'https://example.test' AND r.event_name = 'purchase' AND r.product_category = 'books'
+FROM res;
+----
+true
+
+# Mixed path keeps JSON null distinct from string "null"
+query I
+WITH res AS (
+    SELECT json_extract_columns(
+        '{"url":null,"event_name":"null","products.0.category":null,"products.1.category":"books"}',
+        '{"url":"^url$","event_name":"^event_name$","product_category":"^products.\\d+.category$"}',
+        chr(10)
+    ) AS r)
+SELECT r.url IS NULL AND r.event_name = 'null' AND r.product_category = 'books'
+FROM res;
+----
+true
+
+# Multiple output columns may share the same exact pattern
+query I
+WITH res AS (
+    SELECT json_extract_columns('{"id":"abc"}', '{"first":"^id$","second":"^id$"}', ',') AS r)
+SELECT r.first = 'abc' AND r.second = 'abc'
+FROM res;
+----
+true
+
+# Exact and regex output columns can both receive the same key
+query I
+WITH res AS (
+    SELECT json_extract_columns('{"id":"abc"}', '{"id_exact":"^id$","id_regex":"id"}', ',') AS r)
+SELECT r.id_exact = 'abc' AND r.id_regex = 'abc'
+FROM res;
+----
+true
+
 # No matches return NULL
 query I
 SELECT (json_extract_columns('{"a":1}', '{"missing":"z"}', ',')).missing IS NULL;

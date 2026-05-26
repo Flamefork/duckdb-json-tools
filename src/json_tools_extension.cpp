@@ -31,6 +31,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -1263,11 +1264,9 @@ static inline idx_t CountTrailingZeros(uint64_t x) {
 }
 
 // If `pattern` is of the form `^<simple-identifier>$`, return the identifier;
-// otherwise return empty string. Used to detect the "trivial" extraction mode
-// where every output column maps 1:1 to a fixed top-level key name and we can
-// skip the per-row iter+regex+cache machinery in favour of N direct
-// yyjson_obj_getn lookups.
-static std::string ExtractTrivialKey(const std::string &pattern) {
+// otherwise return empty string. These patterns are exact top-level key lookups,
+// so they do not need RE2 matching at runtime.
+static std::string ExtractExactKey(const std::string &pattern) {
 	if (pattern.size() < 3 || pattern.front() != '^' || pattern.back() != '$') {
 		return "";
 	}
@@ -1290,12 +1289,17 @@ static std::string ExtractTrivialKey(const std::string &pattern) {
 	return std::string(name_begin, name_len);
 }
 
+struct ExactKeyGroup {
+	string key;
+	vector<idx_t> column_indices;
+};
+
 struct JsonExtractColumnsBindData : public FunctionData {
 	JsonExtractColumnsBindData(vector<string> column_names_p, vector<string> patterns_p,
 	                           child_list_t<LogicalType> children_p, duckdb_re2::RE2::Options options_p)
 	    : column_names(std::move(column_names_p)), patterns(std::move(patterns_p)), children(std::move(children_p)),
 	      options(std::move(options_p)), column_count(this->patterns.size()) {
-		DetectTrivialMode();
+		BuildExtractPlan();
 		BuildPatternSet();
 	}
 
@@ -1305,11 +1309,37 @@ struct JsonExtractColumnsBindData : public FunctionData {
 	duckdb_re2::RE2::Options options;
 	unique_ptr<duckdb_re2::RE2::Set> pattern_set;
 	idx_t column_count;
-	// When trivial_mode is true, trivial_keys[i] is the literal JSON key for
-	// column i (unanchored, simple identifier). Runtime skips RE2 + bitset cache
-	// entirely and does column_count × yyjson_obj_getn per row.
-	bool trivial_mode = false;
-	vector<string> trivial_keys;
+	vector<ExactKeyGroup> exact_key_groups;
+	ankerl::unordered_dense::map<std::string_view, idx_t> exact_group_index;
+	vector<idx_t> regex_column_indices;
+	bool direct_exact_mode = false;
+	vector<string> direct_exact_keys;
+
+	bool HasRegexColumns() const {
+		return !regex_column_indices.empty();
+	}
+
+	void AddExactMatches(const char *key_str, idx_t key_len, uint64_t &match_bitset) const {
+		auto exact_it = exact_group_index.find(std::string_view(key_str, key_len));
+		if (exact_it == exact_group_index.end()) {
+			return;
+		}
+		auto &group = exact_key_groups[exact_it->second];
+		for (auto column_idx : group.column_indices) {
+			match_bitset |= (1ULL << column_idx);
+		}
+	}
+
+	void AddExactMatches(const char *key_str, idx_t key_len, vector<int> &match_results) const {
+		auto exact_it = exact_group_index.find(std::string_view(key_str, key_len));
+		if (exact_it == exact_group_index.end()) {
+			return;
+		}
+		auto &group = exact_key_groups[exact_it->second];
+		for (auto column_idx : group.column_indices) {
+			match_results.push_back(static_cast<int>(column_idx));
+		}
+	}
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<JsonExtractColumnsBindData>(column_names, patterns, children, options);
@@ -1322,41 +1352,59 @@ struct JsonExtractColumnsBindData : public FunctionData {
 	}
 
 private:
-	// When trivial mode applies, runtime cost is column_count × O(N/2) yyjson_obj_getn
-	// walks per row vs O(N) iter+cache for the general path (where N is row's top-level
-	// key count). The trivial path wins for small column_count but loses as it scales
-	// linearly with patterns. Sweep on the realistic bench (avg 30 flat keys/row):
-	//   K=16 trivial vs general: -7% (251 vs 271 ms)
-	//   K=25 trivial vs general: +5% regression (328 vs 313 ms)
-	// Crossover sits between K=20 and K=25 for ~30-key rows; cap conservatively at 20.
-	static constexpr idx_t TRIVIAL_MAX_COLUMNS = 20;
+	static constexpr idx_t SMALL_EXACT_MAX_COLUMNS = 20;
 
-	void DetectTrivialMode() {
-		if (patterns.size() > TRIVIAL_MAX_COLUMNS) {
+	void BuildExtractPlan() {
+		ankerl::unordered_dense::map<string, idx_t> exact_group_lookup;
+		for (idx_t column_idx = 0; column_idx < patterns.size(); column_idx++) {
+			auto exact_key = ExtractExactKey(patterns[column_idx]);
+			if (exact_key.empty()) {
+				regex_column_indices.push_back(column_idx);
+				continue;
+			}
+
+			auto group_it = exact_group_lookup.find(exact_key);
+			if (group_it == exact_group_lookup.end()) {
+				idx_t group_idx = exact_key_groups.size();
+				auto &group = exact_key_groups.emplace_back();
+				group.key = std::move(exact_key);
+				group.column_indices.push_back(column_idx);
+				exact_group_lookup.emplace(group.key, group_idx);
+			} else {
+				exact_key_groups[group_it->second].column_indices.push_back(column_idx);
+			}
+		}
+
+		exact_group_index.reserve(exact_key_groups.size());
+		for (idx_t group_idx = 0; group_idx < exact_key_groups.size(); group_idx++) {
+			exact_group_index.emplace(std::string_view(exact_key_groups[group_idx].key), group_idx);
+		}
+
+		direct_exact_mode = regex_column_indices.empty() && column_count <= SMALL_EXACT_MAX_COLUMNS;
+		if (!direct_exact_mode) {
 			return;
 		}
-		trivial_keys.reserve(patterns.size());
-		for (const auto &p : patterns) {
-			auto key = ExtractTrivialKey(p);
-			if (key.empty()) {
-				trivial_keys.clear();
-				trivial_mode = false;
-				return;
+		direct_exact_keys.resize(column_count);
+		for (const auto &group : exact_key_groups) {
+			for (auto column_idx : group.column_indices) {
+				direct_exact_keys[column_idx] = group.key;
 			}
-			trivial_keys.push_back(std::move(key));
 		}
-		trivial_mode = !trivial_keys.empty();
 	}
 
 	void BuildPatternSet() {
+		if (regex_column_indices.empty()) {
+			return;
+		}
 		pattern_set = make_uniq<duckdb_re2::RE2::Set>(options, duckdb_re2::RE2::UNANCHORED);
-		for (idx_t i = 0; i < patterns.size(); i++) {
+		for (idx_t regex_idx = 0; regex_idx < regex_column_indices.size(); regex_idx++) {
+			auto column_idx = regex_column_indices[regex_idx];
 			std::string error;
-			int idx = pattern_set->Add(patterns[i], &error);
+			int idx = pattern_set->Add(patterns[column_idx], &error);
 			if (idx < 0) {
 				throw BinderException("json_extract_columns: %s", error);
 			}
-			D_ASSERT(static_cast<idx_t>(idx) == i);
+			D_ASSERT(static_cast<idx_t>(idx) == regex_idx);
 		}
 		if (!pattern_set->Compile()) {
 			throw BinderException("json_extract_columns: failed to compile pattern set");
@@ -1526,10 +1574,11 @@ struct ChunkedKeyMatchCache {
 };
 
 struct JsonExtractColumnsLocalState : public FunctionLocalState {
-	JsonExtractColumnsLocalState(Allocator &allocator, idx_t column_count)
+	JsonExtractColumnsLocalState(Allocator &allocator, idx_t column_count, idx_t regex_count)
 	    : json_allocator(std::make_shared<JSONAllocator>(allocator)), buffers(column_count),
 	      col_fragments(column_count), use_bitset_cache(column_count <= 64), column_count(column_count) {
 		match_results.reserve(column_count);
+		regex_match_results.reserve(regex_count);
 		for (auto &frags : col_fragments) {
 			frags.reserve(4); // typical multi-match arity is 2-3
 		}
@@ -1546,11 +1595,12 @@ struct JsonExtractColumnsLocalState : public FunctionLocalState {
 	// std::string buffer entirely (direct StringVector::AddString from yyjson).
 	vector<vector<yyjson_val *>> col_fragments;
 
-	// Cache for key→matches (≤64 patterns)
+	// Cache for key→matched output columns (≤64 columns)
 	KeyMatchCache cache;
-	// Chunked cache for key→matches (>64 patterns)
+	// Chunked cache for key→matched output columns (>64 columns)
 	ChunkedKeyMatchCache chunked_cache;
 	vector<int> match_results;
+	vector<int> regex_match_results;
 	bool use_bitset_cache;
 	idx_t column_count;
 };
@@ -1558,8 +1608,10 @@ struct JsonExtractColumnsLocalState : public FunctionLocalState {
 static unique_ptr<FunctionLocalState>
 JsonExtractColumnsInitLocalState(ExpressionState &state, const BoundFunctionExpression &expr, FunctionData *bind_data) {
 	auto &context = state.GetContext();
-	auto column_count = bind_data->Cast<JsonExtractColumnsBindData>().column_names.size();
-	return make_uniq<JsonExtractColumnsLocalState>(BufferAllocator::Get(context), column_count);
+	auto &extract_bind_data = bind_data->Cast<JsonExtractColumnsBindData>();
+	auto column_count = extract_bind_data.column_names.size();
+	auto regex_count = extract_bind_data.regex_column_indices.size();
+	return make_uniq<JsonExtractColumnsLocalState>(BufferAllocator::Get(context), column_count, regex_count);
 }
 
 // Single-match fast path: serialize one yyjson_val straight into the output
@@ -1715,16 +1767,38 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 	UnifiedVectorFormat json_data;
 	args.data[0].ToUnifiedFormat(args.size(), json_data);
 	auto json_inputs = UnifiedVectorFormat::GetData<string_t>(json_data);
+	auto has_regex_columns = bind_data.HasRegexColumns();
 
-	// Trivial-mode fast path: when every column is a fixed top-level key name
-	// (no regex, no prefix, no multi-match possible), skip the iter+cache+
-	// fragments machinery and do column_count × yyjson_obj_getn per row. Wins
-	// for small column_count vs full key iteration; gated by bind-time check
-	// (see DetectTrivialMode) so the general path below stays untouched and
-	// non-trivial workloads see no regression from this branch.
-	if (bind_data.trivial_mode) {
+	auto has_separator_argument = args.ColumnCount() == 3;
+	idx_t separator_column_index = has_separator_argument ? args.ColumnCount() - 1 : 0;
+	bool separator_is_constant = false;
+	std::string separator_constant_storage;
+	const char *separator_constant_ptr = nullptr;
+	idx_t separator_constant_len = 0;
+	if (has_separator_argument) {
+		auto &separator_vec = args.data[separator_column_index];
+		separator_is_constant = separator_vec.GetVectorType() == VectorType::CONSTANT_VECTOR;
+		if (separator_is_constant) {
+			if (ConstantVector::IsNull(separator_vec)) {
+				throw InvalidInputException("json_extract_columns: separator cannot be NULL");
+			}
+			auto separator_value = separator_vec.GetValue(0);
+			separator_constant_storage = StringValue::Get(separator_value);
+			separator_constant_ptr = separator_constant_storage.c_str();
+			separator_constant_len = separator_constant_storage.size();
+		}
+	}
+
+	if (bind_data.direct_exact_mode) {
 		for (idx_t row = 0; row < args.size(); row++) {
 			auto json_idx = json_data.sel->get_index(row);
+			if (has_separator_argument && !separator_is_constant) {
+				auto separator_value = args.GetValue(separator_column_index, row);
+				if (separator_value.IsNull()) {
+					throw InvalidInputException("json_extract_columns: separator cannot be NULL");
+				}
+			}
+
 			if (!json_data.validity.RowIsValid(json_idx)) {
 				result_validity.SetInvalid(row);
 				for (auto &validity : child_validities) {
@@ -1754,7 +1828,7 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 			}
 
 			for (idx_t col_idx = 0; col_idx < column_count; col_idx++) {
-				const auto &key_name = bind_data.trivial_keys[col_idx];
+				const auto &key_name = bind_data.direct_exact_keys[col_idx];
 				auto val = duckdb_yyjson::yyjson_obj_getn(root, key_name.data(), key_name.size());
 				if (!val || yyjson_is_null(val)) {
 					child_validities[col_idx]->SetInvalid(row);
@@ -1765,26 +1839,6 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 			}
 		}
 		return;
-	}
-
-	auto has_separator_argument = args.ColumnCount() == 3;
-	idx_t separator_column_index = has_separator_argument ? args.ColumnCount() - 1 : 0;
-	bool separator_is_constant = false;
-	std::string separator_constant_storage;
-	const char *separator_constant_ptr = nullptr;
-	idx_t separator_constant_len = 0;
-	if (has_separator_argument) {
-		auto &separator_vec = args.data[separator_column_index];
-		separator_is_constant = separator_vec.GetVectorType() == VectorType::CONSTANT_VECTOR;
-		if (separator_is_constant) {
-			if (ConstantVector::IsNull(separator_vec)) {
-				throw InvalidInputException("json_extract_columns: separator cannot be NULL");
-			}
-			auto separator_value = separator_vec.GetValue(0);
-			separator_constant_storage = StringValue::Get(separator_value);
-			separator_constant_ptr = separator_constant_storage.c_str();
-			separator_constant_len = separator_constant_storage.size();
-		}
 	}
 
 	for (idx_t row = 0; row < args.size(); row++) {
@@ -1843,7 +1897,7 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 			frags.clear();
 		}
 
-		// Reset cache if storage is full
+		// Reset key→matches cache if storage is full
 		auto &cache = local_state.cache;
 		auto &chunked_cache = local_state.chunked_cache;
 		if (local_state.use_bitset_cache) {
@@ -1856,7 +1910,6 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 			}
 		}
 
-		auto &pattern_set = *bind_data.pattern_set;
 		const bool use_bitset = local_state.use_bitset_cache;
 
 		yyjson_val *key = nullptr;
@@ -1898,14 +1951,16 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 
 				// On cache miss, compute matches and store in cache
 				if (!cache_hit) {
-					duckdb_re2::StringPiece key_piece(key_str, key_len);
-					local_state.match_results.clear();
-					pattern_set.Match(key_piece, &local_state.match_results);
-
-					// Convert to bitset
 					match_bitset = 0;
-					for (int idx : local_state.match_results) {
-						match_bitset |= (1ULL << idx);
+					bind_data.AddExactMatches(key_str, key_len, match_bitset);
+					if (has_regex_columns) {
+						duckdb_re2::StringPiece key_piece(key_str, key_len);
+						local_state.regex_match_results.clear();
+						bind_data.pattern_set->Match(key_piece, &local_state.regex_match_results);
+						for (int regex_idx : local_state.regex_match_results) {
+							auto column_idx = bind_data.regex_column_indices[regex_idx];
+							match_bitset |= (1ULL << column_idx);
+						}
 					}
 
 					cache.TryInsert(set_idx, key_str, key_len, key_hash, match_bitset);
@@ -1938,9 +1993,17 @@ static void JsonExtractColumnsFunction(DataChunk &args, ExpressionState &state, 
 
 				// On cache miss, compute matches and store in cache
 				if (!cache_hit) {
-					duckdb_re2::StringPiece key_piece(key_str, key_len);
 					local_state.match_results.clear();
-					pattern_set.Match(key_piece, &local_state.match_results);
+					bind_data.AddExactMatches(key_str, key_len, local_state.match_results);
+					if (has_regex_columns) {
+						duckdb_re2::StringPiece key_piece(key_str, key_len);
+						local_state.regex_match_results.clear();
+						bind_data.pattern_set->Match(key_piece, &local_state.regex_match_results);
+						for (int regex_idx : local_state.regex_match_results) {
+							auto column_idx = bind_data.regex_column_indices[regex_idx];
+							local_state.match_results.push_back(static_cast<int>(column_idx));
+						}
+					}
 
 					match_chunks =
 					    chunked_cache.TryInsert(chunked_set_idx, key_str, key_len, key_hash, local_state.match_results);

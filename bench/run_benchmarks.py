@@ -35,8 +35,8 @@ def build_query(scenario_config: dict, data_path: Path) -> str:
     """Build benchmark query that materializes the function output to a TEMP TABLE.
 
     CREATE OR REPLACE TEMP TABLE forces every row to be computed and written
-    to columnar storage — matching the production ETL pattern (rick/data does
-    CTAS / INSERT INTO frequently). This avoids the `CAST(struct AS VARCHAR)`
+    to columnar storage — matching production ETL patterns that use CTAS /
+    INSERT INTO frequently. This avoids the `CAST(struct AS VARCHAR)`
     overhead that dominated the old `sum(length(...))` wrapper for
     json_extract_columns (~43% of measured time was the cast, not the function).
     """
@@ -57,9 +57,10 @@ def build_query(scenario_config: dict, data_path: Path) -> str:
 
         case "json_extract_columns":
             patterns_json = json.dumps(scenario_config["patterns"]).replace("'", "''")
+            json_column = scenario_config["json_column"] if "json_column" in scenario_config else "json_flat"
             return f"""
                 CREATE OR REPLACE TEMP TABLE _bench_out AS
-                SELECT json_extract_columns(json_flat, '{patterns_json}', E'\\n') AS r FROM {table}
+                SELECT json_extract_columns({json_column}, '{patterns_json}', E'\\n') AS r FROM {table}
             """
 
         case "json_group_merge":
@@ -116,8 +117,13 @@ def run_benchmarks(
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     for size, scenario_config in cases_to_run:
-        data_path = DATA_DIR / f"events_{size}.parquet"
+        data_path = (
+            scenario_config["data_file"] if "data_file" in scenario_config else DATA_DIR / f"events_{size}.parquet"
+        )
         if not data_path.exists():
+            if "data_file" in scenario_config:
+                print(f"FAILED: benchmark data file not found: {data_path}")
+                raise SystemExit(2)
             print(f"Skipping {size}: data file not found")
             continue
 
@@ -230,8 +236,9 @@ def main() -> None:
 
     # Build list of (size, scenario) pairs, filtering by prefix if specified
     cases_to_run: list[tuple[str, dict]] = []
-    for size in SIZES.keys():
-        for scenario_config in SCENARIOS:
+    for scenario_config in SCENARIOS:
+        sizes = [scenario_config["size"]] if "size" in scenario_config else SIZES.keys()
+        for size in sizes:
             case_id = get_case_id(scenario_config["function"], size, scenario_config["scenario"])
             if args.filter is None or args.filter in case_id:
                 cases_to_run.append((size, scenario_config))

@@ -2,6 +2,7 @@ from pathlib import Path
 
 BENCH_DIR = Path(__file__).parent
 DATA_DIR = BENCH_DIR / "data"
+REAL_PROD_DATA_DIR = DATA_DIR / "real_prod"
 RESULTS_DIR = BENCH_DIR / "results"
 PROFILES_DIR = RESULTS_DIR / "profiles"
 PROJECT_ROOT = BENCH_DIR.parent
@@ -125,7 +126,7 @@ SCENARIOS = [
         "scenario": "etl_full",
         "patterns": {**_CORE_EXACT, **_UTM_EXACT, **_PAGE_EXACT, **_DEVICE_EXACT, **_GEO_EXACT},
     },
-    # Production-mirror: matches the rick/data `event_attribute_rules` shape
+    # Production-mirror: matches the real event-attribute-rules shape
     # of "few exact + one regex". Lets us measure the realistic mixed case
     # without the spec's regex disqualifying trivial-mode being the headline.
     {
@@ -136,6 +137,19 @@ SCENARIOS = [
             "event_name": "^event_name$",
             "page_url": "^page_url$",
             "ec_item_ids": r"^ec_items\[\d+\]\.item_id$",
+        },
+    },
+    {
+        "function": "json_extract_columns",
+        "scenario": "real_prod",
+        "size": "245k",
+        "data_file": REAL_PROD_DATA_DIR / "events.parquet",
+        "json_column": "event_properties::JSON",
+        "patterns": {
+            "url": "^url$",
+            "event_name": "^event_name$",
+            "goals": "^goals$",
+            "product_category": r"^products.\d+.category$",
         },
     },
     # Prefix bucketing: collapse each field group into a single newline-joined string
