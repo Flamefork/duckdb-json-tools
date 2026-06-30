@@ -47,3 +47,60 @@ statement error
 SELECT json_parse_url('http://[invalid');
 ----
 Invalid Input Error: json_parse_url: invalid URL
+
+# A query value that percent-decodes to invalid UTF-8 (truncated %D0) must not
+# error; it is sanitized to valid UTF-8 with the replacement character U+FFFD.
+query I
+SELECT json_parse_url('https://example.com/?a=%D0') IS NOT NULL;
+----
+true
+
+query I
+SELECT json_extract_string(json_parse_url('https://example.com/?a=%D0'), '$.query_params.a') = chr(65533);
+----
+true
+
+# Backoff path: invalid lead byte followed by a valid ASCII byte (%D0 then 'x').
+query I
+SELECT json_extract_string(json_parse_url('https://example.com/?a=%D0x'), '$.query_params.a') = chr(65533) || 'x';
+----
+true
+
+# Backoff preserves a non-empty valid prefix before the bad byte (the bad byte is
+# mid-string, not leading): 'foo' + U+FFFD + 'bar'. Guards the valid_len > 0 branch.
+query I
+SELECT json_extract_string(json_parse_url('https://example.com/?a=foo%D0bar'), '$.query_params.a') = 'foo' || chr(65533) || 'bar';
+----
+true
+
+# Valid multi-byte UTF-8 is unchanged (%D0%BB decodes to U+043B 'л').
+query I
+SELECT json_extract_string(json_parse_url('https://example.com/?a=%D0%BB'), '$.query_params.a') = chr(1083);
+----
+true
+
+# Sanitization is uniform across every percent-decoded component, not only query
+# values: an invalid-UTF-8 query KEY (%D0) must not error and is sanitized to U+FFFD.
+query I
+SELECT json_parse_url('https://example.com/?%D0=b') IS NOT NULL;
+----
+true
+
+query I
+SELECT json_extract_string(json_parse_url('https://example.com/?%D0=b'), '$.query_params.' || chr(65533)) = 'b';
+----
+true
+
+# Bulk parse over a poison row completes without aborting (maps to the production
+# incident: one malformed URL must not take down the whole scan).
+query I
+SELECT count(json_parse_url(u)) FROM (VALUES ('https://example.com/?a=%D0'), ('https://example.com/?a=b')) t(u);
+----
+2
+
+# The connection is still usable after parsing a poison URL (no fatal/invalidation):
+# a later query in this same test would fail if the session had been invalidated.
+query I
+SELECT 1;
+----
+1

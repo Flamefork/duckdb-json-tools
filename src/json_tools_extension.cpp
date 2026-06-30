@@ -16,6 +16,7 @@
 #include "duckdb/function/scalar/regexp.hpp"
 #include "ada.h"
 #include "re2/set.h"
+#include "utf8proc_wrapper.hpp"
 #include "../duckdb/extension/json/include/json_common.hpp"
 #include "ankerl/unordered_dense.h"
 #include "yyjson.hpp"
@@ -2294,8 +2295,51 @@ static yyjson_mut_val *JsonParseUrlStringView(yyjson_mut_doc *doc, std::string_v
 	return string_value;
 }
 
+// Replace each ill-formed UTF-8 byte with U+FFFD so the result is always valid
+// UTF-8 (per-byte, not WHATWG maximal-subpart). Utf8Proc::Analyze reports the first
+// invalid position; for a bad continuation byte that position lands inside the
+// sequence, so back off to the start of the offending sequence before emitting the
+// replacement.
+static string JsonParseUrlSanitizeUtf8(std::string_view value) {
+	auto data = value.data();
+	auto len = value.size();
+	string out;
+	out.reserve(len);
+	size_t pos = 0;
+	while (pos < len) {
+		size_t invalid_pos = 0;
+		if (Utf8Proc::Analyze(data + pos, len - pos, nullptr, &invalid_pos) != UnicodeType::INVALID) {
+			out.append(data + pos, len - pos);
+			break;
+		}
+		size_t valid_len = invalid_pos;
+		while (valid_len > 0) {
+			if (Utf8Proc::Analyze(data + pos, valid_len, nullptr, nullptr) != UnicodeType::INVALID) {
+				break;
+			}
+			valid_len--;
+		}
+		out.append(data + pos, valid_len);
+		out.append("\xEF\xBF\xBD");
+		pos += valid_len + 1;
+	}
+	return out;
+}
+
 static yyjson_mut_val *JsonParseUrlCopiedString(yyjson_mut_doc *doc, std::string_view value) {
 	auto data = value.empty() ? "" : value.data();
+	// Query keys/values are percent-decoded, so they can carry bytes that are not
+	// valid UTF-8 (e.g. percent-decoding yields a truncated multi-byte sequence).
+	// yyjson refuses to serialize invalid UTF-8 and would fail the whole call;
+	// sanitize first so json_parse_url stays total over arbitrary URL input.
+	if (!Utf8Proc::IsValid(data, value.size())) {
+		auto sanitized = JsonParseUrlSanitizeUtf8(value);
+		auto string_value = yyjson_mut_strncpy(doc, sanitized.c_str(), sanitized.size());
+		if (!string_value) {
+			throw InternalException("json_parse_url: failed to allocate string value");
+		}
+		return string_value;
+	}
 	auto string_value = yyjson_mut_strncpy(doc, data, value.size());
 	if (!string_value) {
 		throw InternalException("json_parse_url: failed to allocate string value");
